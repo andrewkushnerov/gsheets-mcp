@@ -1,0 +1,25 @@
+# Secrets — never commit these
+.env
+credentials.json
+token.json
+service_account.json
+# what Google actually calls these downloads, in case they land here unrenamed
+client_secret*.json
+*-*.iam.gserviceaccount.com.json
+*.pickle
+secrets/
+
+# Personal notes / drafts (article outlines etc.)
+notes/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
