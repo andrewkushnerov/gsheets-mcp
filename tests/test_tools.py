@@ -44,13 +44,16 @@ def test_list_sheets(service):
     assert result["sheets"][0]["rows"] == 100
 
 
-def test_read_sheet_quotes_the_tab_name(values):
+def test_read_sheet_quotes_the_tab_name(values, env):
+    env(gsheets_output_format="json")
     values.get.return_value.execute.return_value = {
         "range": "'Bob''s list'!A1:A1", "values": [["x"]],
     }
     result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Bob's list"})
+    # The default page size rides along in the range, so Google sends a window
+    # rather than the whole tab: 5001 rows is the page plus the has-more probe.
     values.get.assert_called_once_with(
-        spreadsheetId="SSID", range="'Bob''s list'", majorDimension="ROWS"
+        spreadsheetId="SSID", range="'Bob''s list'!1:5001", majorDimension="ROWS"
     )
     assert result["row_count"] == 1
     assert result["values"] == [["x"]]
@@ -66,21 +69,185 @@ def test_read_sheet_with_range(values):
     )
 
 
-def test_read_sheet_truncates_a_huge_tab(values, env):
-    env(gsheets_max_read_rows=2)
-    values.get.return_value.execute.return_value = {"values": [["a"], ["b"], ["c"], ["d"]]}
+def test_read_sheet_pages_a_huge_tab(values, env):
+    env(gsheets_max_read_rows=2, gsheets_output_format="json")
+    # Three rows come back for a page of two: the third is the probe that says
+    # there is more, and it must not reach the caller.
+    values.get.return_value.execute.return_value = {"values": [["a"], ["b"], ["c"]]}
     result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data"})
-    assert result["row_count"] == 4
+    values.get.assert_called_once_with(
+        spreadsheetId="SSID", range="'Data'!1:3", majorDimension="ROWS"
+    )
     assert result["values"] == [["a"], ["b"]]
-    assert result["truncated"] is True
-    assert "range" in result["note"]
+    assert result["row_count"] == 2
+    assert result["next_offset"] == 2
 
 
 def test_read_sheet_does_not_truncate_when_limit_is_zero(values, env):
-    env(gsheets_max_read_rows=0)
+    # JSON on purpose: against a TSV string `"truncated" not in result` would be a
+    # substring check that passes whatever the tool did.
+    env(gsheets_max_read_rows=0, gsheets_output_format="json")
     values.get.return_value.execute.return_value = {"values": [["a"], ["b"], ["c"]]}
     result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data"})
-    assert "truncated" not in result
+    assert "next_offset" not in result
+    assert result["values"] == [["a"], ["b"], ["c"]]
+    # Nothing to narrow to, so the tab is read whole — the pre-paging behaviour.
+    values.get.assert_called_once_with(
+        spreadsheetId="SSID", range="'Data'", majorDimension="ROWS"
+    )
+
+
+def test_read_sheet_pages_inside_an_explicit_range(values, env):
+    env(gsheets_max_read_rows=0)
+    values.batchGet.return_value.execute.return_value = {"valueRanges": []}
+    tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data",
+         "range": "B2:D100", "offset": 10, "limit": 5}
+    )
+    # Row 12 is ten rows into a range that starts at row 2, and D17 is the fifth row
+    # of the page plus the probe. The repeated header is the range's own first row,
+    # B2, not row 1 of the sheet.
+    values.batchGet.assert_called_once_with(
+        spreadsheetId="SSID",
+        ranges=["'Data'!B2:D2", "'Data'!B12:D17"],
+        majorDimension="ROWS",
+    )
+
+
+def test_read_sheet_page_two_carries_the_header_in_one_round_trip(values, env):
+    env(gsheets_max_read_rows=2, gsheets_output_format="json")
+    values.batchGet.return_value.execute.return_value = {
+        "valueRanges": [
+            {"range": "'Data'!A1:B1", "values": [["id", "name"]]},
+            {"range": "'Data'!A3:B5", "values": [["3", "c"], ["4", "d"]]},
+        ]
+    }
+    result = tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "offset": 2}
+    )
+    values.batchGet.assert_called_once_with(
+        spreadsheetId="SSID", ranges=["'Data'!1:1", "'Data'!3:5"], majorDimension="ROWS"
+    )
+    values.get.assert_not_called()
+    assert result["header_row"] is True
+    assert result["values"] == [["id", "name"], ["3", "c"], ["4", "d"]]
+    # The repeated header is context, not a row of the page — it must not shift
+    # the count the next offset is computed from.
+    assert result["row_count"] == 2
+    assert "next_offset" not in result
+
+
+def test_read_sheet_can_turn_the_repeated_header_off(values, env):
+    env(gsheets_max_read_rows=2, gsheets_output_format="json")
+    values.get.return_value.execute.return_value = {"values": [["3", "c"]]}
+    result = tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data",
+         "offset": 2, "include_header": False}
+    )
+    values.batchGet.assert_not_called()
+    assert "header_row" not in result
+    assert result["values"] == [["3", "c"]]
+
+
+def test_read_sheet_past_the_end_of_a_range_costs_no_round_trip(values, env):
+    """A page starting past 'A1:C50' is empty, and Google need not confirm it."""
+    env(gsheets_output_format="json")
+    result = tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "range": "A1:C50", "offset": 100}
+    )
+    values.get.assert_not_called()
+    values.batchGet.assert_not_called()
+    assert result["values"] == []
+    assert result["row_count"] == 0
+
+
+def test_read_sheet_limit_cannot_exceed_the_server_cap(values, env):
+    env(gsheets_max_read_rows=10)
+    values.get.return_value.execute.return_value = {"values": []}
+    tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data", "limit": 9999})
+    values.get.assert_called_once_with(
+        spreadsheetId="SSID", range="'Data'!1:11", majorDimension="ROWS"
+    )
+
+
+def test_read_sheet_limit_below_the_cap_is_honoured(values, env):
+    env(gsheets_max_read_rows=5000)
+    values.get.return_value.execute.return_value = {"values": []}
+    tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data", "limit": 3})
+    values.get.assert_called_once_with(
+        spreadsheetId="SSID", range="'Data'!1:4", majorDimension="ROWS"
+    )
+
+
+def test_read_sheet_takes_a_numeric_offset_as_a_string(values, env):
+    """A model that fills in a JSON Schema integer with "2" meant 2."""
+    env(gsheets_max_read_rows=2)
+    values.get.return_value.execute.return_value = {"values": []}
+    tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data",
+         "offset": "2", "include_header": False}
+    )
+    values.get.assert_called_once_with(
+        spreadsheetId="SSID", range="'Data'!3:5", majorDimension="ROWS"
+    )
+
+
+def test_read_sheet_rejects_a_nonsense_offset(values):
+    with pytest.raises(ValueError, match="whole number"):
+        tools.gsheets_read_sheet(
+            {"spreadsheet_id": "SSID", "sheet_name": "Data", "offset": "soon"}
+        )
+    with pytest.raises(ValueError, match="0 or more"):
+        tools.gsheets_read_sheet(
+            {"spreadsheet_id": "SSID", "sheet_name": "Data", "offset": -5}
+        )
+
+
+def test_read_sheet_returns_tsv_by_default(values):
+    values.get.return_value.execute.return_value = {
+        "range": "'Data'!A1:B5001", "values": [["id", "name"], ["1", "Widget"]],
+    }
+    result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data"})
+    # The reported range is trimmed to what came back, but keeps the API's columns.
+    assert result == "range: 'Data'!A1:B2\nrows: 2\n\nid\tname\n1\tWidget"
+
+
+def test_read_sheet_tsv_pads_ragged_rows(values):
+    """The API drops trailing empty cells, but the grid must stay rectangular."""
+    values.get.return_value.execute.return_value = {"values": [["a", "b", "c"], ["d"]]}
+    result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data"})
+    assert result.splitlines()[-2:] == ["a\tb\tc", "d\t\t"]
+
+
+def test_read_sheet_tsv_says_how_to_get_the_next_page(values, env):
+    env(gsheets_max_read_rows=2)
+    values.get.return_value.execute.return_value = {"values": [["a"], ["b"], ["c"]]}
+    result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data"})
+    assert "rows: 2; more follow — call again with offset=2" in result
+    assert result.endswith("a\nb")
+
+
+def test_read_sheet_tsv_is_silent_about_paging_on_the_last_page(values, env):
+    env(gsheets_max_read_rows=2)
+    values.get.return_value.execute.return_value = {"values": [["a"]]}
+    result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data"})
+    assert "more follow" not in result
+    assert result.endswith("rows: 1\n\na")
+
+
+def test_output_format_is_case_insensitive(values, env):
+    """It arrives from a shell or a .env file, where nobody is watching the case."""
+    env(gsheets_output_format="JSON")
+    values.get.return_value.execute.return_value = {"values": [["a"]]}
+    result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data"})
+    assert result["values"] == [["a"]]
+
+
+def test_read_sheet_tsv_of_an_empty_sheet_is_just_the_header(values):
+    """No grid means no separator blank line, and no trailing whitespace."""
+    values.get.return_value.execute.return_value = {"values": []}
+    result = tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data"})
+    assert result == "rows: 0"
 
 
 def test_update_full_replace_clears_then_appends(values):

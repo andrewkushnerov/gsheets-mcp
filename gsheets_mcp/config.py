@@ -6,7 +6,9 @@ with no configuration at all beyond Google credentials.
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,12 +33,23 @@ class Settings(BaseSettings):
     # to JSON-decode a list-typed field coming from the environment.
     gsheets_allowed_spreadsheets: str = ""
     gsheets_max_read_rows: int = 5000
+    # Wire format for the tools that return a grid of cells. The same 1000x8 table
+    # costs ~37k tokens as indented JSON and ~16k as TSV, and the API hands us
+    # every cell as a string anyway, so TSV loses nothing. Set "json" if something
+    # downstream parses the tool output instead of reading it.
+    gsheets_output_format: Literal["tsv", "json"] = "tsv"
     # Off by default: searching Drive is the one capability that lets the model
     # discover documents you never handed it. Turning it on also needs a wider
     # OAuth scope, so re-run scripts/google_authorize.py afterwards.
     gsheets_enable_drive_search: bool = False
 
     log_level: str = "INFO"
+
+    @field_validator("gsheets_output_format", mode="before")
+    @classmethod
+    def _normalise_output_format(cls, value):
+        """Accept ``TSV`` and `` tsv `` the same as ``tsv`` — it arrives from a shell."""
+        return value.strip().lower() if isinstance(value, str) else value
 
     @property
     def allowed_spreadsheets(self) -> set[str]:

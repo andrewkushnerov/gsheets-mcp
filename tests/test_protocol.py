@@ -117,7 +117,8 @@ def test_batch_of_only_notifications_produces_no_response():
     assert protocol.handle_payload(batch) is None
 
 
-def test_tool_call_serialises_the_handler_result():
+def test_tool_call_serialises_the_handler_result(env):
+    env(gsheets_output_format="json")
     service = mock.MagicMock()
     service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
         "range": "'Sheet1'!A1:B2",
@@ -130,7 +131,27 @@ def test_tool_call_serialises_the_handler_result():
              "arguments": {"spreadsheet_id": "SSID", "sheet_name": "Sheet1"}},
         )["result"]
     assert result["isError"] is False
-    assert '"row_count": 2' in result["content"][0]["text"]
+    # No space after the colon: results are serialised compactly, because the
+    # reader is a model and indentation is tokens it pays for and cannot use.
+    assert '"row_count":2' in result["content"][0]["text"]
+
+
+def test_tool_call_passes_a_text_result_through_unchanged(env):
+    """A tool that already returns text (TSV) must not be re-encoded as JSON."""
+    env(gsheets_output_format="tsv")
+    service = mock.MagicMock()
+    service.spreadsheets.return_value.values.return_value.get.return_value.execute.return_value = {
+        "range": "'Sheet1'!A1:B2",
+        "values": [["a", "b"], ["1", "2"]],
+    }
+    with mock.patch.object(tools, "get_sheets_service", return_value=service):
+        result = rpc(
+            "tools/call",
+            {"name": "gsheets_read_sheet",
+             "arguments": {"spreadsheet_id": "SSID", "sheet_name": "Sheet1"}},
+        )["result"]
+    assert result["isError"] is False
+    assert result["content"][0]["text"].endswith("a\tb\n1\t2")
 
 
 def test_failing_tool_becomes_an_error_result_not_a_protocol_error():

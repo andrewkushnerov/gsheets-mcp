@@ -20,7 +20,14 @@ from __future__ import annotations
 import json
 
 from .config import get_settings
-from .formatting import PALETTE, a1_to_grid_range, parse_color
+from .formatting import (
+    EMPTY_WINDOW,
+    PALETTE,
+    a1_to_grid_range,
+    parse_color,
+    rows_to_tsv,
+    window_a1,
+)
 from .google_client import get_drive_service, get_sheets_service, service_account_email
 from .registry import mcp_tool
 
@@ -73,6 +80,20 @@ def _values_2d(args: dict, key: str = "values") -> list[list]:
     if not isinstance(values, list) or any(not isinstance(row, list) for row in values):
         raise ValueError(f"'{key}' must be a 2D array (a list of row arrays)")
     return values
+
+
+def _whole_number(args: dict, key: str, default: int) -> int:
+    """An optional non-negative integer argument. Models pass "10" as often as 10."""
+    value = args.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{key}' must be a whole number, got {value!r}") from None
+    if number < 0:
+        raise ValueError(f"'{key}' must be 0 or more, got {number}")
+    return number
 
 
 def _input_option(args: dict) -> str:
@@ -296,11 +317,47 @@ def gsheets_list_sheets(args: dict) -> dict:
     }
 
 
+def _render_grid(payload: dict) -> dict | str:
+    """A grid response in whichever wire format ``GSHEETS_OUTPUT_FORMAT`` asks for.
+
+    JSON keeps the structure; TSV says the same things as a two-line header plus a
+    tab-separated table, and costs the model roughly half the tokens for a table of
+    any size — indented JSON spends three lines and ~40 bytes on a cell that TSV
+    writes with one tab. Nothing is lost in the trade: the values API is called
+    without ``valueRenderOption``, so every cell already arrives as a string.
+
+    Both formats are rendered from the same dict, so they cannot drift on the facts.
+    """
+    if get_settings().gsheets_output_format == "json":
+        return payload
+
+    head = []
+    if payload.get("range"):
+        head.append(f"range: {payload['range']}")
+
+    line = f"rows: {payload['row_count']}"
+    if payload.get("offset"):
+        line += f" from offset {payload['offset']}"
+    if payload.get("header_row"):
+        line += " (+ the header row repeated above them)"
+    if payload.get("next_offset") is not None:
+        line += f"; more follow — call again with offset={payload['next_offset']}"
+    head.append(line)
+
+    body = rows_to_tsv(payload["values"])
+    # A blank line separates the header from the grid, but only when there is a
+    # grid — an empty sheet should not end in trailing whitespace.
+    return "\n".join(head) + (f"\n\n{body}" if body else "")
+
+
 @mcp_tool(
     "gsheets_read_sheet",
-    "Read a sheet's content as a 2D array of rows. Trailing empty rows and cells are "
-    "omitted by the API, so rows may have different lengths. Pass `range` to read only "
-    "part of the sheet.",
+    "Read a sheet's content. Returns a `range:`/`rows:` header, a blank line, then the "
+    "cells as a tab-separated grid, one row per line; a tab or newline inside a cell is "
+    "escaped to a literal \\t or \\n. (With GSHEETS_OUTPUT_FORMAT=json the same data "
+    "comes back as a JSON 2D array instead.) Big sheets come back a page at a time: when "
+    "the `rows:` line names a follow-up offset, call again with it to get the next page. "
+    "Pass `range` to read only part of the sheet.",
     {
         "type": "object",
         "properties": {
@@ -309,40 +366,114 @@ def gsheets_list_sheets(args: dict) -> dict:
             "range": {
                 "type": "string",
                 "description": "Optional A1 range within the sheet, e.g. 'A1:C50'. "
-                               "Omit to read the whole sheet.",
+                               "Omit to read the whole sheet. `offset` and `limit` "
+                               "page within this range.",
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Skip this many rows. To read the next page, pass the "
+                               "offset the previous call told you to.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Rows to return. Defaults to the server's page size and "
+                               "cannot exceed it (GSHEETS_MAX_READ_ROWS).",
+            },
+            "include_header": {
+                "type": "boolean",
+                "description": "Repeat the range's first row above the page, so columns "
+                               "stay named past offset 0. Default true; no effect at "
+                               "offset 0, where that row is already there.",
             },
         },
         "required": ["spreadsheet_id", "sheet_name"],
     },
 )
-def gsheets_read_sheet(args: dict) -> dict:
+def gsheets_read_sheet(args: dict) -> dict | str:
+    return _render_grid(read_grid(args))
+
+
+def read_grid(args: dict) -> dict:
+    """The facts of a read — range, row count, values — before any wire format.
+
+    Split out from the tool so that reading a sheet stays composable: another tool
+    that wants the cells wants a list of lists, not the TSV a model reads. The tool
+    itself is that plus one call to :func:`_render_grid`.
+    """
     spreadsheet_id = _spreadsheet_id(args)
     sheet_name = _require(args, "sheet_name")
     cell_range = args.get("range")
-    range_ref = _quote_sheet(sheet_name) + (f"!{cell_range}" if cell_range else "")
+    sheet = _quote_sheet(sheet_name)
 
-    service = get_sheets_service()
-    result = _execute(
-        service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=range_ref, majorDimension="ROWS"
-        ),
-        spreadsheet_id,
-    )
-    values = result.get("values", [])
-    total = len(values)
+    offset = _whole_number(args, "offset", 0)
+    cap = get_settings().gsheets_max_read_rows
+    limit = _whole_number(args, "limit", cap)
+    # The cap is a guard rail, not a suggestion: no single call gets past it. Zero
+    # on either side means "no limit", which is what GSHEETS_MAX_READ_ROWS=0 buys.
+    if cap:
+        limit = min(limit, cap) if limit else cap
 
-    # A 40k-row tab would swamp the model's context and the answer would be worse,
-    # not better. Truncate loudly so the model knows to ask for a narrower range.
-    limit = get_settings().gsheets_max_read_rows
-    payload = {"range": result.get("range"), "row_count": total, "values": values}
-    if limit and total > limit:
-        payload["values"] = values[:limit]
-        payload["truncated"] = True
-        payload["returned_rows"] = limit
-        payload["note"] = (
-            f"Sheet has {total} rows; only the first {limit} are returned "
-            f"(GSHEETS_MAX_READ_ROWS). Pass an explicit `range` to read further."
-        )
+    # Ask for one row more than the page. If it comes back there is a next page —
+    # learned from the same request, with no second call and no guess at the
+    # sheet's real height (gridProperties counts the grid, not the data).
+    window = window_a1(cell_range, offset, limit + 1 if limit else None)
+    if window is None:
+        # Unbounded in rows and columns both, which A1 cannot spell. Read the range
+        # and take the page here; the only cost is bandwidth we asked not to spend.
+        fetch, local_offset = cell_range, offset
+    else:
+        fetch, local_offset = window, 0
+
+    header_rows: list[list] = []
+    result: dict = {}
+    if window != EMPTY_WINDOW:
+        service = get_sheets_service()
+        ref = sheet + (f"!{fetch}" if fetch else "")
+        if offset and args.get("include_header", True):
+            # Page 2 of a headerless grid is a table the model has to guess at. The
+            # header rides along in the same round trip rather than costing a call.
+            batch = _execute(
+                service.spreadsheets().values().batchGet(
+                    spreadsheetId=spreadsheet_id,
+                    ranges=[f"{sheet}!{window_a1(cell_range, 0, 1)}", ref],
+                    majorDimension="ROWS",
+                ),
+                spreadsheet_id,
+            )
+            parts = batch.get("valueRanges") or []
+            header_rows = (parts[0].get("values") or [])[:1] if parts else []
+            result = parts[1] if len(parts) > 1 else {}
+        else:
+            result = _execute(
+                service.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id, range=ref, majorDimension="ROWS"
+                ),
+                spreadsheet_id,
+            )
+
+    values = (result.get("values") or [])[local_offset:]
+    next_offset = None
+    if limit and len(values) > limit:
+        values = values[:limit]
+        next_offset = offset + limit
+
+    # Report the range actually returned, not the one-row-longer range we probed.
+    # Re-windowing the API's own echo keeps the real column letters: it answers
+    # "A1:H5001" to a whole-rows request, and only the last row needs correcting.
+    echoed = result.get("range")
+    covered = window_a1(echoed, 0, len(values)) if values and echoed else None
+    payload = {
+        "range": f"{sheet}!{covered}" if covered else result.get("range"),
+        "offset": offset,
+        "row_count": len(values),
+        "values": header_rows + values,
+    }
+    if header_rows:
+        payload["header_row"] = True
+    if next_offset is not None:
+        payload["next_offset"] = next_offset
     return payload
 
 

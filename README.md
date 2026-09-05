@@ -31,6 +31,7 @@ Very simple, just roughly 1,500 lines of Python — the cleaned-up version of an
 - [Security](#security)
 - [How it works](#how-it-works)
 - [Development](#development)
+- [Changelog](CHANGELOG.md)
 
 ---
 
@@ -161,7 +162,7 @@ Put the HTTP server behind HTTPS (Caddy, nginx, Traefik), set `MCP_AUTH_TOKEN`, 
 | Tool | Writes | What it does |
 |---|:---:|---|
 | `gsheets_list_sheets` | no | Tabs of a spreadsheet: title, `sheet_id`, index, grid size. Start here. |
-| `gsheets_read_sheet` | no | One tab as a 2D array of rows. Optional A1 `range`. |
+| `gsheets_read_sheet` | no | One tab as a tab-separated grid (or JSON, see `GSHEETS_OUTPUT_FORMAT`). Optional A1 `range`, paged with `offset`/`limit`. |
 | `gsheets_append_rows` | yes | Adds rows below the last non-empty one. Nothing is overwritten. |
 | `gsheets_update_sheet` | destructive | With `range`, a partial update anchored at that cell. Without one, replaces the whole tab. |
 | `gsheets_format_cells` | yes | Background fill, text colour, bold, italic. Values are untouched. |
@@ -177,6 +178,23 @@ https://docs.google.com/spreadsheets/d/<spreadsheet_id>/edit
 ```
 
 A full replace (`gsheets_update_sheet` with no `range`) clears the *values* and rewrites them, so formatting, conditional rules and the tab itself survive.
+
+### Reading a big tab
+
+A read never downloads the whole sheet. `GSHEETS_MAX_READ_ROWS` is the page size, it is pushed into the A1 range so Google sends the page rather than the tab, and the response says where to continue:
+
+```
+range: 'Orders'!A1:H5000
+rows: 5000; more follow — call again with offset=5000
+```
+
+Call again with that `offset` for the next page. From page two on, the range's first row is repeated above the page — in the same request, so a page still costs one round trip — which keeps the columns named:
+
+```
+rows: 5000 from offset 5000 (+ the header row repeated above them); more follow — call again with offset=10000
+```
+
+Pass `include_header: false` to turn that off, or `limit` to ask for a smaller page. `limit` cannot exceed the server's cap; that is the point of the cap.
 
 ### Colouring cells
 
@@ -216,7 +234,8 @@ All settings are environment variables, read from `.env` if it's there. Every on
 | `MCP_AUTH_TOKEN` | — | Required bearer token. Empty means no auth, so localhost only. |
 | `GSHEETS_READ_ONLY` | `false` | `true` and the write tools aren't registered at all. |
 | `GSHEETS_ALLOWED_SPREADSHEETS` | — | Comma-separated ids. Empty means anything the Google identity can open. |
-| `GSHEETS_MAX_READ_ROWS` | `5000` | Truncate reads (loudly) above this. `0` is unlimited. |
+| `GSHEETS_MAX_READ_ROWS` | `5000` | Page size for reads, and the ceiling on `limit`. `0` is unlimited and disables paging. |
+| `GSHEETS_OUTPUT_FORMAT` | `tsv` | Sheet contents as a tab-separated grid, or `json` for a 2D array. TSV costs roughly half the tokens. |
 | `GSHEETS_ENABLE_DRIVE_SEARCH` | `false` | `true` registers `gsheets_find_spreadsheets` and asks for the Drive scope. |
 | `LOG_LEVEL` | `INFO` | Standard Python levels. |
 
@@ -255,6 +274,7 @@ Adding a tool is one decorated function, and nothing else in the codebase needs 
 
 ```python
 from gsheets_mcp.registry import mcp_tool
+from gsheets_mcp.tools import read_grid
 
 @mcp_tool(
     "gsheets_row_count",
@@ -269,7 +289,7 @@ from gsheets_mcp.registry import mcp_tool
     },
 )
 def gsheets_row_count(args):
-    return {"rows": len(gsheets_read_sheet(args)["values"])}
+    return {"rows": len(read_grid(args)["values"])}
 ```
 
 The description and JSON Schema *are* the prompt the model sees. Vague descriptions are the number one reason a tool never gets called, or gets called wrong.
@@ -279,13 +299,13 @@ The description and JSON Schema *are* the prompt the model sees. Vague descripti
 The tests came with the install above, so there's nothing else to set up:
 
 ```bash
-python -m pytest tests -q     # 89 tests, no network, no credentials needed
+python -m pytest tests -q     # 117 tests, no network, no credentials needed
 ```
 
 Run them with `python -m` rather than bare `pytest`: nothing is installed, so the
 repo root only reaches `sys.path` because `-m` puts it there.
 
-Tests mock the Sheets service, so the suite runs offline. `tests/test_protocol.py` covers the JSON-RPC surface, `tests/test_http.py` the transport and auth, `tests/test_tools.py` the tools themselves, and `tests/test_formatting.py` the A1-and-colour parsing — that one touches nothing, so it can afford to be exhaustive.
+Tests mock the Sheets service, so the suite runs offline. `tests/test_protocol.py` covers the JSON-RPC surface, `tests/test_http.py` the transport and auth, `tests/test_tools.py` the tools themselves, and `tests/test_formatting.py` the A1, colour, paging-window and TSV rendering — that one touches nothing, so it can afford to be exhaustive.
 
 Poke at a running server by hand:
 
@@ -294,6 +314,8 @@ curl -s localhost:8077/mcp \
   -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python -m json.tool
 ```
+
+Released versions and what changed in each are in [CHANGELOG.md](CHANGELOG.md).
 
 Contributions welcome, issues and PRs both.
 

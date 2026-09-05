@@ -23,7 +23,7 @@ from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
-SERVER_INFO = {"name": "gsheets-mcp", "version": "0.1.0"}
+SERVER_INFO = {"name": "gsheets-mcp", "version": "0.2.0"}
 
 # Newest revision we target. We echo the client's version back when we know it,
 # so negotiation keeps working across client releases.
@@ -181,5 +181,8 @@ def _handle_tools_call(params: dict) -> dict:
             "isError": True,
         }
     if not isinstance(data, str):
-        data = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+        # No indent: the reader is a model, not a person with a pretty-printer, and
+        # on a nested array indent=2 puts every cell on its own line — it nearly
+        # doubles the tokens of every result for no gain in comprehension.
+        data = json.dumps(data, ensure_ascii=False, separators=(",", ":"), default=str)
     return {"content": [{"type": "text", "text": data}], "isError": False}
