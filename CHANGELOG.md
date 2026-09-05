@@ -45,7 +45,7 @@ table costs ~16k tokens instead of ~37k.
 - A client that paged by hand with explicit `range` arguments can keep doing so —
   `offset`/`limit` page *within* `range` — but no longer needs to.
 
-## 0.1.0 — 2026-09-05
+## 0.1.0 — 2026-08-10
 
 First public release. A self-hosted MCP server that gives a model your Google
 Sheets, in roughly 1,500 lines of Python.
