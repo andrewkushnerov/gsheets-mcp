@@ -23,7 +23,7 @@ from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
-SERVER_INFO = {"name": "gsheets-mcp", "version": "0.2.0"}
+SERVER_INFO = {"name": "gsheets-mcp", "version": "0.1.0"}
 
 # Newest revision we target. We echo the client's version back when we know it,
 # so negotiation keeps working across client releases.
