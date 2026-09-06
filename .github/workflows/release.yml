@@ -1,0 +1,67 @@
+name: Release
+
+# Pushing a tag publishes the release. The manual trigger is for tags that were
+# pushed before this workflow existed — it takes the tag name as input.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write # creating a release is a write to the repository
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The notes are read from the default branch rather than from the tag:
+          # CHANGELOG.md was only added in 0.2.0, so v0.1.0's own tree has no such
+          # file. Full history and tags, because the version check below reads the
+          # tagged commit.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Publish the release from CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+
+          # The version the server reports over MCP and the version being tagged
+          # are two literals that can drift. This is the moment to catch that:
+          # before a release exists that lies about what is inside it.
+          in_code=$(git show "$TAG":gsheets_mcp/protocol.py \
+            | sed -n 's/.*"version": "\([^"]*\)".*/\1/p')
+          if [ "$in_code" != "$version" ]; then
+            echo "::error::$TAG points at code reporting version '$in_code'"
+            exit 1
+          fi
+
+          # Everything under '## <version>' up to the next '## ' heading. Compared
+          # as a literal string, not a regex, so the dots in 0.2.1 stay dots.
+          notes=$(awk -v v="$version" '
+            /^## / {
+              if (found) exit
+              split(substr($0, 4), head, " ")
+              gsub(/[\[\]]/, "", head[1])
+              if (head[1] == v) found = 1
+              next
+            }
+            found && !started && /^[[:space:]]*$/ { next }
+            found { started = 1; print }
+          ' CHANGELOG.md)
+          if [ -z "$notes" ]; then
+            echo "::error::CHANGELOG.md has no '## $version' section"
+            exit 1
+          fi
+
+          gh release create "$TAG" --title "$TAG" --notes "$notes"
