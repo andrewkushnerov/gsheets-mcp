@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.1 — 2026-09-06
+
+Hardening for the HTTP transport, and one more protocol revision on the list. No
+tool changed, and nothing here affects a stdio setup except the version bump.
+
+### Fixed
+
+- The `/mcp` endpoint no longer runs the JSON-RPC handler on the event loop. The
+  tools beneath it make blocking calls to Google, so one slow read used to stall
+  every other request the worker had — `/healthz` included — for the whole round
+  trip. It now runs in a worker thread.
+
+### Security
+
+- Cross-origin browser requests to `/mcp` are rejected with `403`, which is what
+  the Streamable HTTP transport requires. Binding to `127.0.0.1` is not a defence
+  on its own: a page on the open web can point its own domain at loopback and
+  arrive as same-origin. The `Origin` header is what tells that apart from a real
+  local client, so the check runs *before* the token check — it has to cover the
+  case that needs it most, a local server started with no `MCP_AUTH_TOKEN`.
+- `MCP_ALLOWED_ORIGINS` — comma-separated origins allowed past that check.
+  Loopback is always allowed, and clients that send no `Origin` (Claude Code,
+  curl, a reverse proxy) are unaffected, so local and stdio setups need nothing.
+
+### Added
+
+- `2025-11-25` is negotiated alongside the revisions already supported, and is now
+  what an unrecognised version is answered with. Nothing in it breaks a tools-only
+  server, and its two hard requirements — `403` on a bad `Origin`, and input
+  validation reported as a tool error rather than a protocol error — were already
+  met, the first by this release and the second since 0.1.0.
+
 ## 0.2.0 — 2026-09-05
 
 Read optimisation: TSV instead of JSON, paging instead of a full download. A 1000×8

@@ -23,12 +23,16 @@ from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
-SERVER_INFO = {"name": "gsheets-mcp", "version": "0.2.0"}
+SERVER_INFO = {"name": "gsheets-mcp", "version": "0.2.1"}
 
 # Newest revision we target. We echo the client's version back when we know it,
 # so negotiation keeps working across client releases.
-DEFAULT_PROTOCOL_VERSION = "2025-06-18"
-SUPPORTED_PROTOCOL_VERSIONS = {"2025-06-18", "2025-03-26", "2024-11-05"}
+DEFAULT_PROTOCOL_VERSION = "2025-11-25"
+# Every revision that still opens with an ``initialize`` handshake. 2026-07-28 replaced
+# that handshake with a per-request version in ``_meta`` and a mandatory server/discover,
+# so it is a different era of the protocol rather than another entry here: a client that
+# speaks it probes, gets "method not found", and falls back to the handshake below.
+SUPPORTED_PROTOCOL_VERSIONS = {"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
 
 # Fed to the model by every MCP client, so this is the one place to explain what the
 # server is for and how its tools fit together. Assembled per request rather than
@@ -137,7 +141,13 @@ def handle_message(message: Any) -> dict | None:
 
 
 def handle_payload(payload: Any) -> list[dict] | dict | None:
-    """Handle a whole request body: a single message or a JSON-RPC batch."""
+    """Handle a whole request body: a single message or a JSON-RPC batch.
+
+    Batching was *removed* from MCP in revision 2025-06-18, so this is deliberately
+    more than the newest spec asks for rather than an implementation of it. It stays
+    because it costs three lines, and because 2024-11-05 and 2025-03-26 are both
+    still in SUPPORTED_PROTOCOL_VERSIONS — a client pinned to either may send one.
+    """
     if isinstance(payload, list):
         responses = [r for r in (handle_message(m) for m in payload) if r is not None]
         return responses or None

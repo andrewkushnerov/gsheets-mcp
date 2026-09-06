@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import hmac
 import logging
+from urllib.parse import urlsplit
 
+from anyio import to_thread
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
@@ -36,6 +38,30 @@ def require_token(request: Request, settings: Settings = Depends(get_settings)) 
             detail="Missing or invalid bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+#: Where a browser legitimately is when it talks to a server running on this machine.
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def require_allowed_origin(request: Request, settings: Settings = Depends(get_settings)) -> None:
+    """Reject cross-origin browser requests — the spec's DNS-rebinding guard.
+
+    Binding to 127.0.0.1 is not a defence on its own: a page anyone can visit may
+    resolve its own domain to 127.0.0.1 and then reach this server as same-origin,
+    which is why a local server with no token is reachable from the web. The Origin
+    header is what tells that apart from a real local client, so it is checked even
+    when auth is off — especially then. Non-browser clients (Claude Code, curl, a
+    reverse proxy) send no Origin at all and are untouched by this.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return
+    if urlsplit(origin).hostname in _LOOPBACK_HOSTS:
+        return
+    if origin.strip().rstrip("/").lower() in settings.allowed_origins:
+        return
+    raise HTTPException(status_code=403, detail=f"Origin not allowed: {origin}")
 
 
 def create_app() -> FastAPI:
@@ -67,7 +93,11 @@ def create_app() -> FastAPI:
 
     @app.post("/mcp", include_in_schema=False)
     @app.post("/mcp/", include_in_schema=False)
-    async def mcp_endpoint(request: Request, _: None = Depends(require_token)):
+    async def mcp_endpoint(
+        request: Request,
+        _origin: None = Depends(require_allowed_origin),
+        _auth: None = Depends(require_token),
+    ):
         try:
             payload = await request.json()
         except Exception:
@@ -76,7 +106,10 @@ def create_app() -> FastAPI:
                  "error": {"code": protocol.PARSE_ERROR, "message": "Invalid JSON"}},
                 status_code=400,
             )
-        response = protocol.handle_payload(payload)
+        # handle_payload is synchronous, and the tools under it make blocking HTTPS
+        # calls to Google. Run on the event loop it would stall every other request
+        # this worker has — /healthz included — for the whole round trip.
+        response = await to_thread.run_sync(protocol.handle_payload, payload)
         # Nothing to say = the batch was all notifications. MCP expects 202 here.
         if response is None:
             return Response(status_code=202)

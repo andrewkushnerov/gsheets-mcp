@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8077
     mcp_auth_token: str = ""
+    # Comma-separated browser origins allowed to POST /mcp, e.g. "https://app.example.com".
+    # Loopback is always allowed, and non-browser clients (Claude Code, curl, a reverse
+    # proxy) send no Origin at all, so this stays empty for every local setup.
+    mcp_allowed_origins: str = ""
 
     # --- Guard rails ---
     gsheets_read_only: bool = False
@@ -54,6 +58,11 @@ class Settings(BaseSettings):
     @property
     def allowed_spreadsheets(self) -> set[str]:
         return {s.strip() for s in self.gsheets_allowed_spreadsheets.split(",") if s.strip()}
+
+    @property
+    def allowed_origins(self) -> set[str]:
+        origins = self.mcp_allowed_origins.split(",")
+        return {o.strip().rstrip("/").lower() for o in origins if o.strip()}
 
     @property
     def auth_enabled(self) -> bool:

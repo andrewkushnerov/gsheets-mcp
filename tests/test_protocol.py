@@ -26,9 +26,10 @@ def rpc(method, params=None, msg_id=1):
 
 
 def test_initialize_echoes_known_protocol_version():
-    result = rpc("initialize", {"protocolVersion": "2025-03-26"})["result"]
-    assert result["protocolVersion"] == "2025-03-26"
-    assert result["serverInfo"]["name"] == "gsheets-mcp"
+    for version in protocol.SUPPORTED_PROTOCOL_VERSIONS:
+        result = rpc("initialize", {"protocolVersion": version})["result"]
+        assert result["protocolVersion"] == version
+        assert result["serverInfo"]["name"] == "gsheets-mcp"
     assert "spreadsheet_id" in result["instructions"]
 
 

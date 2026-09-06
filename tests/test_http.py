@@ -90,3 +90,34 @@ def test_read_only_instance_advertises_only_read_tools(env):
     names = {t["name"] for t in rpc(c, "tools/list").json()["result"]["tools"]}
     assert names == {"gsheets_list_sheets", "gsheets_read_sheet"}
     assert c.get("/").json()["read_only"] is True
+
+
+def test_a_local_browser_origin_is_allowed():
+    for origin in ("http://localhost:3000", "http://127.0.0.1:8077", "http://[::1]:9"):
+        assert rpc(client(), "ping", headers={"origin": origin}).status_code == 200
+
+
+def test_a_foreign_origin_is_rejected_even_without_auth():
+    # The DNS-rebinding case: no token configured, so this 403 is the only guard.
+    response = rpc(client(), "ping", headers={"origin": "https://evil.example"})
+    assert response.status_code == 403
+    assert "evil.example" in response.json()["detail"]
+
+
+def test_an_opaque_origin_is_rejected():
+    # Sandboxed iframes and file:// pages send this.
+    assert rpc(client(), "ping", headers={"origin": "null"}).status_code == 403
+
+
+def test_a_configured_origin_is_allowed(env):
+    c = client(env, mcp_allowed_origins="https://app.example, https://other.example/")
+    assert rpc(c, "ping", headers={"origin": "https://app.example"}).status_code == 200
+    assert rpc(c, "ping", headers={"origin": "https://other.example"}).status_code == 200
+    assert rpc(c, "ping", headers={"origin": "https://nope.example"}).status_code == 403
+
+
+def test_origin_is_checked_before_the_token(env):
+    # A rebinding attacker has no token either; the clearer error is the origin one.
+    c = client(env, mcp_auth_token="s3cret")
+    response = rpc(c, "ping", headers={"origin": "https://evil.example"})
+    assert response.status_code == 403
