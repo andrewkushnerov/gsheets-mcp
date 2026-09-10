@@ -1,4 +1,5 @@
 """Protocol-level tests: the JSON-RPC surface an MCP client actually exercises."""
+from pathlib import Path
 from unittest import mock
 
 from gsheets_mcp import protocol, tools
@@ -165,3 +166,16 @@ def test_failing_tool_becomes_an_error_result_not_a_protocol_error():
 
 def test_unknown_tool():
     assert rpc("tools/call", {"name": "nope"})["error"]["code"] == protocol.INVALID_PARAMS
+
+
+def test_changelog_documents_the_reported_version():
+    """The release workflow cuts its notes from the CHANGELOG section named by the
+    version in the code, so a bump without notes — or notes without a bump — has to
+    fail here, at ``pytest``, and not half-way through publishing a release."""
+    changelog = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+    newest = next(
+        line[3:].split()[0].strip("[]")
+        for line in changelog.read_text(encoding="utf-8").splitlines()
+        if line.startswith("## ")
+    )
+    assert newest == protocol.SERVER_INFO["version"]

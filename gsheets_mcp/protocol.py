@@ -18,12 +18,12 @@ import json
 import logging
 from typing import Any
 
-from . import registry
+from . import __version__, registry
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
-SERVER_INFO = {"name": "gsheets-mcp", "version": "0.2.1"}
+SERVER_INFO = {"name": "gsheets-mcp", "version": __version__}
 
 # Newest revision we target. We echo the client's version back when we know it,
 # so negotiation keeps working across client releases.

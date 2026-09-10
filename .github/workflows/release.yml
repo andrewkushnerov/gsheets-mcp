@@ -1,18 +1,17 @@
 name: Release
 
-# Pushing a tag publishes the release. The manual trigger is for tags that were
-# pushed before this workflow existed — it takes the tag name as input.
+# Bumping ``__version__`` on the default branch is what publishes a release. This
+# workflow reads that literal, takes the notes from CHANGELOG.md and creates the
+# release — and with it the tag. Tags are an output here, so do not push them by
+# hand: a hand-pushed tag triggers nothing and only blocks the version it names.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: ["gsheets_mcp/__init__.py"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to publish, e.g. v0.1.0"
-        required: true
 
 permissions:
-  contents: write # creating a release is a write to the repository
+  contents: write # creating a release, and the tag under it, writes to the repository
 
 jobs:
   release:
@@ -20,34 +19,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The notes are read from the default branch rather than from the tag:
-          # CHANGELOG.md was only added in 0.2.0, so v0.1.0's own tree has no such
-          # file. Full history and tags, because the version check below reads the
-          # tagged commit.
-          ref: ${{ github.event.repository.default_branch }}
+          # Full history and tags, because the guard below asks git whether this
+          # version has been released already.
           fetch-depth: 0
           fetch-tags: true
 
       - name: Publish the release from CHANGELOG.md
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          version="${TAG#v}"
+          # __init__.py imports nothing, so this needs no dependencies installed.
+          version=$(python3 -c 'import gsheets_mcp; print(gsheets_mcp.__version__)')
 
-          # The version the server reports over MCP and the version being tagged
-          # are two literals that can drift. This is the moment to catch that:
-          # before a release exists that lies about what is inside it.
-          in_code=$(git show "$TAG":gsheets_mcp/protocol.py \
-            | sed -n 's/.*"version": "\([^"]*\)".*/\1/p')
-          if [ "$in_code" != "$version" ]; then
-            echo "::error::$TAG points at code reporting version '$in_code'"
-            exit 1
+          # __init__.py can change for reasons other than a bump, and the manual
+          # trigger can be fired twice. Either way the tag already existing means
+          # this version is out.
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already released — nothing to do"
+            exit 0
           fi
 
           # Everything under '## <version>' up to the next '## ' heading. Compared
-          # as a literal string, not a regex, so the dots in 0.2.1 stay dots.
+          # as a literal string, not a regex, so the dots in 0.3.0 stay dots.
           notes=$(awk -v v="$version" '
             /^## / {
               if (found) exit
@@ -64,4 +58,7 @@ jobs:
             exit 1
           fi
 
-          gh release create "$TAG" --title "$TAG" --notes "$notes"
+          # --target tags this commit as part of publishing, so the tag never
+          # outlives a release that failed to happen.
+          gh release create "v$version" \
+            --target "$GITHUB_SHA" --title "v$version" --notes "$notes"
