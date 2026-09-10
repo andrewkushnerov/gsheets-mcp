@@ -6,7 +6,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-> Hey Buddy! Spin up a new google sheet for me through my gsheets mcp: call it "lisbon two weeks". I want a row per day for the next 14 days starting today: date, day of the week, air temp in Lisbon, sea temp. Paint the day lines light grey, weekends blue, bold the header with green. Look up the actual forecast, don't make the numbers up!
+> Hey Buddy! Spin up a new google sheet for me through my gsheets mcp: call it "lisbon two weeks". I want a row per day for the next 14 days starting today: date, day of the week, air temp in Lisbon, sea temp. Paint the day lines light grey, weekends blue, bold the header with green. Please add linear graph for air temp and sea temp. Look up the actual forecast, don't make the numbers up!
 
 ![Claude creating and formatting a Google Sheet through gsheets-mcp](docs/demo.png)
 
@@ -166,6 +166,7 @@ Put the HTTP server behind HTTPS (Caddy, nginx, Traefik), set `MCP_AUTH_TOKEN`, 
 | `gsheets_append_rows` | yes | Adds rows below the last non-empty one. Nothing is overwritten. |
 | `gsheets_update_sheet` | destructive | With `range`, a partial update anchored at that cell. Without one, replaces the whole tab. |
 | `gsheets_format_cells` | yes | Background fill, text colour, bold, italic. Values are untouched. |
+| `gsheets_add_chart` | yes | A line, column, bar, area or scatter chart drawn from a range on the sheet. |
 | `gsheets_add_sheet` | yes | New empty tab, optional grid size. |
 | `gsheets_delete_sheet` | destructive | Deletes a tab by name. Irreversible. |
 | `gsheets_create_spreadsheet` | yes | A brand-new spreadsheet, optionally with named tabs. Returns its id and URL. |
@@ -205,6 +206,22 @@ Pass `include_header: false` to turn that off, or `limit` to ask for a smaller p
 Colours are a hex string (`#4285f4`), a name (`red`, `orange`, `yellow`, `green`, `blue`, `purple`, `pink`, `cyan`, `grey`, `white`, `black` — the light highlight shades from the Sheets colour picker), or `none` to clear the fill. Ranges can be open-ended: `A1:D1` is a block, `A2:A` is a column from row 2 down, `5:5` is a whole row, and omitting the range formats the tab.
 
 Only the properties you pass are touched. Setting a background will not silently un-bold the text.
+
+### Charting a table
+
+`gsheets_add_chart` draws one chart from one range. The first column of the range is the x axis and every column after it is a series named by its header, so a table like this
+
+| Month | Revenue | Costs |
+|---|---|---|
+| Jan | 41000 | 28000 |
+
+is a two-line chart in one call:
+
+> Chart revenue and costs by month from A1:C13 as a line chart.
+
+`chart_type` is `column` (vertical bars, the default), `bar` (horizontal), `line`, `area` or `scatter` — Google's names, where a "bar chart" lies on its side. The range takes whole columns too: `A:C` keeps the chart correct as rows are appended below it.
+
+The chart floats one column to the right of the range unless you give it an `anchor` cell (`F2`) or ask for `new_sheet: true`. `stacked` stacks the series on column, bar and area charts; `has_header: false` plots the first row instead of reading it as series names; `width` and `height` are pixels.
 
 ### Finding a spreadsheet by name
 

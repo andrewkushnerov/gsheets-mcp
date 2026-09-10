@@ -362,6 +362,153 @@ def test_add_sheet_with_grid_size(service):
     }
 
 
+@pytest.fixture
+def charted(service):
+    """A sheet to chart on, plus the addChart reply Google sends back."""
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [{"properties": {"title": "Data", "sheetId": 5,
+                                   "gridProperties": {"rowCount": 1000, "columnCount": 26}}}],
+    }
+    service.spreadsheets.return_value.batchUpdate.return_value.execute.return_value = {
+        "replies": [{"addChart": {"chart": {"chartId": 777, "position": {"sheetId": 88}}}}],
+    }
+    return service
+
+
+def _chart_request(service):
+    body = service.spreadsheets.return_value.batchUpdate.call_args.kwargs["body"]
+    return body["requests"][0]["addChart"]["chart"]
+
+
+def test_add_chart_plots_the_first_column_against_the_rest(charted):
+    result = tools.gsheets_add_chart(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:D20"}
+    )
+    chart = _chart_request(charted)
+    basic = chart["spec"]["basicChart"]
+    assert basic["chartType"] == "COLUMN"
+    # The header row rides along in every source; headerCount is what stops it being
+    # plotted and makes it the series name instead.
+    assert basic["headerCount"] == 1
+    assert basic["domains"][0]["domain"]["sourceRange"]["sources"] == [
+        {"sheetId": 5, "startRowIndex": 0, "endRowIndex": 20,
+         "startColumnIndex": 0, "endColumnIndex": 1},
+    ]
+    plotted = [s["series"]["sourceRange"]["sources"][0] for s in basic["series"]]
+    assert [source["startColumnIndex"] for source in plotted] == [1, 2, 3]
+    # Level with the top of the table, with column E left blank between the two.
+    assert chart["position"]["overlayPosition"]["anchorCell"] == {
+        "sheetId": 5, "rowIndex": 0, "columnIndex": 5,
+    }
+    assert result == {"chart_id": 777, "chart_type": "COLUMN", "sheet_name": "Data",
+                      "data_range": "A1:D20", "series": 3, "anchor": "F1"}
+
+
+def test_add_chart_takes_a_type_a_title_and_an_anchor(charted):
+    result = tools.gsheets_add_chart(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "B2:C50",
+         "chart_type": "Line", "title": "Revenue", "anchor": "H10",
+         "width": 800, "height": 400}
+    )
+    chart = _chart_request(charted)
+    assert chart["spec"]["title"] == "Revenue"
+    assert chart["spec"]["basicChart"]["chartType"] == "LINE"
+    assert chart["position"]["overlayPosition"] == {
+        "anchorCell": {"sheetId": 5, "rowIndex": 9, "columnIndex": 7},
+        "widthPixels": 800, "heightPixels": 400,
+    }
+    assert result["anchor"] == "H10"
+    assert result["series"] == 1
+
+
+def test_add_chart_accepts_whole_columns(charted):
+    tools.gsheets_add_chart(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A:C"}
+    )
+    basic = _chart_request(charted)["spec"]["basicChart"]
+    # No row bounds at all: the chart follows the table as rows are added below it.
+    assert basic["domains"][0]["domain"]["sourceRange"]["sources"] == [
+        {"sheetId": 5, "startColumnIndex": 0, "endColumnIndex": 1},
+    ]
+
+
+def test_add_chart_on_its_own_sheet(charted):
+    result = tools.gsheets_add_chart(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:B10",
+         "new_sheet": True, "anchor": "Z9"}
+    )
+    assert _chart_request(charted)["position"] == {"newSheet": True}
+    assert result["chart_sheet_id"] == 88
+    assert "anchor" not in result
+
+
+def test_add_chart_anchor_stays_inside_a_narrow_grid(service):
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "sheets": [{"properties": {"title": "Data", "sheetId": 5,
+                                   "gridProperties": {"rowCount": 20, "columnCount": 4}}}],
+    }
+    service.spreadsheets.return_value.batchUpdate.return_value.execute.return_value = {
+        "replies": [{"addChart": {"chart": {"chartId": 1}}}],
+    }
+    result = tools.gsheets_add_chart(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:D20"}
+    )
+    # Column E is past the end of a four-column grid, and an anchor outside the grid
+    # is an API error. The chart itself still hangs over the edge from D1.
+    assert result["anchor"] == "D1"
+
+
+def test_add_chart_stacks_only_where_that_means_something(charted):
+    tools.gsheets_add_chart(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:D20",
+         "stacked": True}
+    )
+    assert _chart_request(charted)["spec"]["basicChart"]["stackedType"] == "STACKED"
+
+    tools.gsheets_add_chart(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:D20",
+         "chart_type": "line", "stacked": True}
+    )
+    assert "stackedType" not in _chart_request(charted)["spec"]["basicChart"]
+
+
+def test_add_chart_can_plot_a_table_with_no_header_row(charted):
+    tools.gsheets_add_chart(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:B9",
+         "has_header": False}
+    )
+    assert _chart_request(charted)["spec"]["basicChart"]["headerCount"] == 0
+
+
+def test_add_chart_needs_the_columns_named(charted):
+    with pytest.raises(ValueError, match="which columns"):
+        tools.gsheets_add_chart(
+            {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "1:20"}
+        )
+
+
+def test_add_chart_needs_a_second_column_to_plot(charted):
+    with pytest.raises(ValueError, match="one column wide"):
+        tools.gsheets_add_chart(
+            {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:A20"}
+        )
+
+
+def test_add_chart_refuses_an_obviously_wrong_range(charted):
+    with pytest.raises(ValueError, match="narrow it"):
+        tools.gsheets_add_chart(
+            {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:BZ20"}
+        )
+
+
+def test_add_chart_rejects_an_unknown_type(charted):
+    with pytest.raises(ValueError, match="unknown chart_type"):
+        tools.gsheets_add_chart(
+            {"spreadsheet_id": "SSID", "sheet_name": "Data", "data_range": "A1:D20",
+             "chart_type": "pie"}
+        )
+
+
 def test_delete_sheet_resolves_the_id_by_name(service):
     service.spreadsheets.return_value.get.return_value.execute.return_value = {
         "sheets": [{"properties": {"title": "Data", "sheetId": 0}},

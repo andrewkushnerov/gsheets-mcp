@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0 — 2026-09-10
+
+### Added
+
+- `gsheets_add_chart` — a chart drawn from a range that is already on the sheet:
+  line, column, bar, area or scatter. The range is read as a table, first column
+  the x axis and every column after it a series named by its header, which is the
+  shape a model already has in hand after writing the data. It floats one column
+  right of that range by default, so placing it costs no arguments; `anchor`,
+  `new_sheet`, `stacked`, `width` and `height` are there when the default is wrong.
+
 ## 0.2.1 — 2026-09-06
 
 Hardening for the HTTP transport, and one more protocol revision on the list. No

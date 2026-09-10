@@ -24,6 +24,7 @@ from .formatting import (
     EMPTY_WINDOW,
     PALETTE,
     a1_to_grid_range,
+    column_letters,
     parse_color,
     rows_to_tsv,
     window_a1,
@@ -140,8 +141,12 @@ def _execute(request, spreadsheet_id: str | None = None):
         raise RuntimeError(f"Google Sheets API error ({status}): {detail}") from exc
 
 
-def _sheet_id_by_name(service, spreadsheet_id: str, sheet_name: str):
-    """Resolve a tab's numeric sheetId; on a miss, name the tabs that do exist."""
+def _sheet_properties(service, spreadsheet_id: str, sheet_name: str) -> dict:
+    """A tab's SheetProperties; on a miss, name the tabs that do exist.
+
+    One request answers both questions a write tool asks — which sheetId, and how
+    big is the grid — so the caller that needs the size does not pay for a second.
+    """
     meta = _execute(
         service.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="sheets.properties"),
         spreadsheet_id,
@@ -150,9 +155,14 @@ def _sheet_id_by_name(service, spreadsheet_id: str, sheet_name: str):
     for sheet in meta.get("sheets", []):
         properties = sheet.get("properties", {})
         if properties.get("title") == sheet_name:
-            return properties.get("sheetId")
+            return properties
         titles.append(properties.get("title"))
     raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {titles}")
+
+
+def _sheet_id_by_name(service, spreadsheet_id: str, sheet_name: str):
+    """Resolve a tab's numeric sheetId."""
+    return _sheet_properties(service, spreadsheet_id, sheet_name).get("sheetId")
 
 
 def _drive_execute(request):
@@ -856,3 +866,206 @@ def gsheets_delete_sheet(args: dict) -> dict:
         spreadsheet_id,
     )
     return {"deleted": sheet_name, "sheet_id": sheet_id}
+
+
+# A chart is one shape drawn over one table, so this is one tool with a type
+# argument rather than five near-identical ones: all five are the same `basicChart`
+# spec with a different word in it. The names are Google's, where BAR runs
+# horizontally and COLUMN vertically — the opposite of what half the world means by
+# "bar chart", which is what the aliases are for.
+_CHART_TYPES = {
+    "line": "LINE",
+    "column": "COLUMN",
+    "bar": "BAR",
+    "area": "AREA",
+    "scatter": "SCATTER",
+}
+_CHART_ALIASES = {
+    "lines": "line",
+    "columns": "column",
+    "bars": "bar",
+    "areas": "area",
+    "vertical bar": "column",
+    "horizontal bar": "bar",
+    "scatterplot": "scatter",
+}
+#: Where "stack the series" means anything.
+_STACKABLE = ("COLUMN", "BAR", "AREA")
+#: Past this, the range was mis-selected — nobody reads a chart with 200 lines on it.
+_MAX_SERIES = 30
+
+
+def _chart_type(args: dict) -> str:
+    value = str(args.get("chart_type") or "column").strip().lower().replace("_", " ")
+    value = _CHART_ALIASES.get(value, value)
+    if value not in _CHART_TYPES:
+        raise ValueError(
+            f"unknown chart_type {args.get('chart_type')!r}. Use one of: "
+            f"{', '.join(_CHART_TYPES)}."
+        )
+    return _CHART_TYPES[value]
+
+
+def _inside_grid(index: int, count) -> int:
+    """Clamp an anchor cell to the grid: a chart may hang over the edge, its anchor may not."""
+    return index if not count else min(index, int(count) - 1)
+
+
+@mcp_tool(
+    "gsheets_add_chart",
+    "Draw a chart from a table already on the sheet — line, column (vertical bars), bar "
+    "(horizontal), area or scatter. `data_range` is the table including its header row: "
+    "the first column is the x axis, every other column becomes one series named by its "
+    "header, so 'A1:D20' plots three lines against the labels in column A. The chart "
+    "floats just right of the data unless you give an `anchor` cell or `new_sheet`. "
+    "Values are not touched.",
+    {
+        "type": "object",
+        "properties": {
+            "spreadsheet_id": _SPREADSHEET_ID_PROP,
+            "sheet_name": _SHEET_NAME_PROP,
+            "data_range": {
+                "type": "string",
+                "description": "A1 range of the table to plot, header row included: 'A1:D20', "
+                               "or 'A:D' for whole columns. First column = x axis labels, "
+                               "each column after it = one line or bar. Both sides must name "
+                               "their columns.",
+            },
+            "chart_type": {
+                "type": "string",
+                "enum": ["column", "line", "bar", "area", "scatter"],
+                "description": "column (default) is vertical bars, bar is horizontal.",
+            },
+            "title": {"type": "string", "description": "Chart title."},
+            "anchor": {
+                "type": "string",
+                "description": "Top-left cell the chart sits over, e.g. 'F2'. Default: one "
+                               "column right of `data_range`, level with its first row.",
+            },
+            "new_sheet": {
+                "type": "boolean",
+                "description": "Put the chart on a new sheet of its own instead of over "
+                               "this one. Ignores `anchor`.",
+            },
+            "has_header": {
+                "type": "boolean",
+                "description": "The first row of `data_range` names the series (default "
+                               "true). false plots that row as data instead.",
+            },
+            "stacked": {
+                "type": "boolean",
+                "description": "Stack the series on top of each other. Column, bar and area "
+                               "charts only; ignored for line and scatter.",
+            },
+            "width": {"type": "integer", "description": "Width in pixels (default 600)."},
+            "height": {"type": "integer", "description": "Height in pixels (default 371)."},
+        },
+        "required": ["spreadsheet_id", "sheet_name", "data_range"],
+    },
+    annotations={"destructiveHint": False, "idempotentHint": False},
+    read_only=False,
+)
+def gsheets_add_chart(args: dict) -> dict:
+    spreadsheet_id = _spreadsheet_id(args)
+    sheet_name = _require(args, "sheet_name")
+    data_range = str(_require(args, "data_range"))
+    chart_type = _chart_type(args)
+
+    service = get_sheets_service()
+    properties = _sheet_properties(service, spreadsheet_id, sheet_name)
+    sheet_id = properties.get("sheetId")
+
+    # One GridRange over the whole table, then one column-wide slice of it per series.
+    # Rows may be unbounded ('A:D' is a legitimate "the whole table, however long it
+    # grows"), but a chart cannot guess which columns to plot.
+    table = a1_to_grid_range(sheet_id, data_range)
+    first_column = table.get("startColumnIndex")
+    last_column = table.get("endColumnIndex")
+    if first_column is None or last_column is None:
+        raise ValueError(
+            f"'{data_range}' does not say which columns to plot. Name them on both sides: "
+            "'A1:D20' for a block, 'A:D' for whole columns."
+        )
+    if last_column - first_column < 2:
+        raise ValueError(
+            f"'{data_range}' is one column wide. A chart needs at least two: the first holds "
+            "the x-axis labels, the rest are the values."
+        )
+    if last_column - first_column - 1 > _MAX_SERIES:
+        raise ValueError(
+            f"'{data_range}' would plot {last_column - first_column - 1} series. That is "
+            f"almost certainly the wrong range — narrow it to at most {_MAX_SERIES} value "
+            "columns."
+        )
+
+    def source(column: int) -> dict:
+        return {
+            "sourceRange": {
+                "sources": [{**table, "startColumnIndex": column, "endColumnIndex": column + 1}]
+            }
+        }
+
+    series = [
+        {"series": source(column), "targetAxis": "LEFT_AXIS"}
+        for column in range(first_column + 1, last_column)
+    ]
+    basic_chart = {
+        "chartType": chart_type,
+        "legendPosition": "BOTTOM_LEGEND",
+        # What tells Sheets to read the first row as series names rather than plot it.
+        "headerCount": 0 if args.get("has_header") is False else 1,
+        "domains": [{"domain": source(first_column)}],
+        "series": series,
+    }
+    if args.get("stacked") and chart_type in _STACKABLE:
+        basic_chart["stackedType"] = "STACKED"
+
+    spec: dict = {"basicChart": basic_chart}
+    if args.get("title"):
+        spec["title"] = str(args["title"])
+
+    if args.get("new_sheet"):
+        position = {"newSheet": True}
+        anchor_a1 = None
+    else:
+        grid = properties.get("gridProperties") or {}
+        if args.get("anchor"):
+            cell = a1_to_grid_range(sheet_id, str(args["anchor"]))
+            row, column = cell.get("startRowIndex", 0), cell.get("startColumnIndex", 0)
+        else:
+            # Level with the top of the table, one blank column clear of its last one.
+            row, column = table.get("startRowIndex", 0), last_column + 1
+        row = _inside_grid(row, grid.get("rowCount"))
+        column = _inside_grid(column, grid.get("columnCount"))
+        overlay = {"anchorCell": {"sheetId": sheet_id, "rowIndex": row, "columnIndex": column}}
+        width = _whole_number(args, "width", 0)
+        height = _whole_number(args, "height", 0)
+        if width:
+            overlay["widthPixels"] = width
+        if height:
+            overlay["heightPixels"] = height
+        position = {"overlayPosition": overlay}
+        anchor_a1 = f"{column_letters(column)}{row + 1}"
+
+    reply = _execute(
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addChart": {"chart": {"spec": spec, "position": position}}}]},
+        ),
+        spreadsheet_id,
+    )
+    chart = (reply.get("replies") or [{}])[0].get("addChart", {}).get("chart", {})
+
+    result = {
+        "chart_id": chart.get("chartId"),
+        "chart_type": chart_type,
+        "sheet_name": sheet_name,
+        "data_range": data_range,
+        "series": len(series),
+    }
+    if anchor_a1:
+        result["anchor"] = anchor_a1
+    else:
+        # A chart on its own sheet lands on a tab the caller never named; say which.
+        result["chart_sheet_id"] = (chart.get("position") or {}).get("sheetId")
+    return result

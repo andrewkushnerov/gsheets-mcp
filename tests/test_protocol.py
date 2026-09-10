@@ -10,6 +10,7 @@ WRITE_TOOLS = {
     "gsheets_delete_sheet",
     "gsheets_create_spreadsheet",
     "gsheets_format_cells",
+    "gsheets_add_chart",
 }
 READ_TOOLS = {"gsheets_list_sheets", "gsheets_read_sheet"}
 #: Registered only when GSHEETS_ENABLE_DRIVE_SEARCH is on, so absent from the sets above.
