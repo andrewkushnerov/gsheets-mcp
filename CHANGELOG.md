@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.4.0 — 2026-09-20
+
+### Added
+
+- `gsheets_list_sheets` profiles the tabs it lists. Per tab: one line per column
+  with its letter, name and inferred type, a few sample rows, and roughly how many
+  rows of data the tab actually holds — which `gridProperties.rowCount` never said,
+  because it counts the grid and a blank tab claims a thousand rows. Answering "what
+  is in this document" used to mean a read per tab, and a read is capped at 5000
+  rows precisely because a page of them is expensive; a twelve-column page costs
+  around 120k tokens to learn twelve column names. The preview is two batched round
+  trips for the whole document however many tabs it has, and costs a few hundred
+  tokens a tab.
+- `sample_rows` (default 3, capped at 20) and `preview: false` on the same tool.
+  With preview off it is the old bare listing, and one API call rather than three.
+  `sample_rows: 0` prints no rows and still names and types every column, which on a
+  wide document is most of the value for about half the tokens. The rows the types
+  are inferred from are read either way and are not the rows printed: a type is a
+  claim about the column, and inferring it from the print window made `sample_rows: 0`
+  answer `empty` for everything — "nothing under this header" — next to a row count
+  saying otherwise.
+
+- The tab line reports `charts=N`, so a model that is about to draw a chart can see
+  the one that is already there. The chart ids ride along in the properties request
+  that was being made anyway, so this costs no call and three tokens.
+- `(gap at N)` on the tab line: row N is blank and has content below it, which is a
+  totals line or a note under the table rather than the end of it. A row count on its
+  own cannot tell those apart, and a read that trusts it swallows the footer.
+
+### Changed
+
+- The tab line is `gid=` rather than `sheet_id=` — no tool takes one as an argument,
+  so the only use left is the `#gid=` fragment of a tab's URL — and it no longer
+  carries the grid size once the real row count is known. `grid=` still appears where
+  it is the only size there is: an empty tab, or `preview: false`.
+- The tool's own description is about 44% shorter than the first cut of it. It is paid
+  in `tools/list` for every conversation the server is connected to, whether or not a
+  spreadsheet ever comes up.
+- `gsheets_list_sheets` returns tab-separated text by default, the way the read
+  tools already do. As JSON every profiled column spent a pair of braces and three
+  quoted keys to say what one tab-separated line says, on every column of every tab.
+  `GSHEETS_OUTPUT_FORMAT=json` returns the structured form, now with `schema`,
+  `sample`, `data_rows`, `empty_columns` and `empty` alongside the existing fields.
+  **This changes the shape of the tool's output** for anything parsing it.
+- The server instructions and `gsheets_read_sheet`'s description now say that
+  reading a whole tab to find out what is in it is the wrong move, and point at the
+  preview instead. The instructions are what the model actually reads, so a tool
+  nothing tells it to prefer is a tool it will not reach for.
+
 ## 0.3.0 — 2026-09-10
 
 ### Added

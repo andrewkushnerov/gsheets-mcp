@@ -225,3 +225,115 @@ def rows_to_tsv(rows) -> str:
         "\t".join(escape_cell(cell) for cell in list(row) + [""] * (width - len(row)))
         for row in rows
     )
+
+
+# ---------------------------------------------------------------------------
+# Column profiling — what a handful of rows says about the shape of a table
+# ---------------------------------------------------------------------------
+
+#: What the API renders for the two booleans. Sheets upper-cases them whatever the
+#: cell was typed as, so this is the whole set rather than a sample of it.
+_BOOLEANS = {"TRUE", "FALSE"}
+
+#: ISO first, then the slash and dot forms a locale renders. Deliberately strict:
+#: a column is only called a date when every sampled cell matches, so a pattern
+#: loose enough to catch the stragglers would mislabel far more than it caught.
+_DATE = re.compile(
+    r"\d{4}-\d{1,2}-\d{1,2}([ T]\d{1,2}:\d{2}(:\d{2})?)?"
+    r"|\d{1,2}[./]\d{1,2}[./]\d{2,4}"
+)
+
+#: Thousands-grouped digits, either convention, with either decimal mark after
+#: them. Matched as a whole so a lone comma
+#: keeps its other meaning: '1,5' is a decimal to half the world, and only groups
+#: of exactly three digits are unambiguous enough to throw away.
+_GROUPED = re.compile(r"[-+]?\d{1,3}(?:[,\u00a0 ]\d{3})+(?P<fraction>[.,]\d+)?")
+
+_SEPARATORS = re.compile(r"[,\u00a0 ]")
+_CURRENCY = "$€£¥₽₴₸"
+
+
+def _is_number(text: str) -> bool:
+    """Does this *formatted* cell read as a number?
+
+    The values API is called without ``valueRenderOption``, so every cell arrives
+    as the string the sheet displays — ``'$1,240.50'``, ``'12%'`` and ``'(340)'``
+    included. Undoing that presentation is the only way to tell a numeric column
+    from a text one, and being wrong either way is cheap: the type is a hint for
+    the model, never something the server acts on.
+    """
+    cleaned = text.strip().lstrip(_CURRENCY).rstrip("%").strip()
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = "-" + cleaned[1:-1]  # accounting negatives
+    grouped = _GROUPED.fullmatch(cleaned)
+    if grouped:
+        # Only the grouping goes. The decimal mark after the last group is whichever
+        # one this locale renders, so '1 240,50' must not collapse to 124050.
+        fraction = grouped.group("fraction") or ""
+        whole = cleaned[: len(cleaned) - len(fraction)]
+        cleaned = _SEPARATORS.sub("", whole) + fraction.replace(",", ".")
+    elif cleaned.count(",") == 1 and "." not in cleaned:
+        cleaned = cleaned.replace(",", ".")  # decimal comma
+    if not any(char.isdigit() for char in cleaned):
+        # float() also accepts 'nan' and 'inf', which in a spreadsheet are words.
+        return False
+    try:
+        float(cleaned)
+    except ValueError:
+        return False
+    return True
+
+
+def cell_type(value) -> str:
+    """One formatted cell -> ``bool`` / ``date`` / ``number`` / ``text``."""
+    text = str(value).strip()
+    if text.upper() in _BOOLEANS:
+        return "bool"
+    if _DATE.fullmatch(text):
+        return "date"
+    if _is_number(text):
+        return "number"
+    return "text"
+
+
+def guess_type(values) -> str:
+    """The type a column's sampled cells agree on, or ``mixed`` / ``empty``."""
+    seen = {cell_type(value) for value in values if str(value).strip()}
+    if not seen:
+        return "empty"
+    if len(seen) == 1:
+        return seen.pop()
+    # A revenue column with an 'n/a' in one row is still a revenue column. Only a
+    # disagreement between two *content* types is worth reporting as mixed, so the
+    # text arm is dropped first — placeholders are written as text by definition.
+    seen.discard("text")
+    return seen.pop() if len(seen) == 1 else "mixed"
+
+
+def profile_columns(rows, has_header: bool = True) -> tuple[list[dict], list[str]]:
+    """Sampled rows -> one record per column that carries anything, plus the empties.
+
+    Columns blank top to bottom in the sample *and* unnamed are dropped rather than
+    reported: twenty lines of "(empty)" teach a model nothing and it pays for every
+    one of them. Their letters come back separately, so nothing is silently hidden.
+
+    A column with a header but no sampled values is kept. An unfilled column that
+    someone bothered to name is structure, and it is where the next write goes.
+    """
+    rows = list(rows)
+    width = max((len(row) for row in rows), default=0)
+    header = rows[0] if has_header and rows else []
+    body = rows[1:] if has_header else rows
+
+    columns: list[dict] = []
+    empty: list[str] = []
+    for index in range(width):
+        name = str(header[index]).strip() if index < len(header) else ""
+        kind = guess_type(row[index] for row in body if index < len(row))
+        if kind == "empty" and not name:
+            empty.append(column_letters(index))
+            continue
+        columns.append(
+            {"letter": column_letters(index), "index": index, "name": name, "type": kind}
+        )
+    return columns, empty

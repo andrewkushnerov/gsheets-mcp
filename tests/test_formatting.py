@@ -6,8 +6,11 @@ from gsheets_mcp.formatting import (
     a1_to_grid_range,
     column_index,
     column_letters,
+    cell_type,
     escape_cell,
+    guess_type,
     parse_color,
+    profile_columns,
     rows_to_tsv,
     window_a1,
 )
@@ -176,3 +179,61 @@ def test_window_with_no_limit_is_open_ended_when_it_can_be():
 def test_window_rejects_a_range_with_only_one_column_named():
     with pytest.raises(ValueError, match="both sides or neither"):
         window_a1("A1:5", 0, 10)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("41000", "number"),
+        ("1,240.50", "number"),      # thousands, US
+        ("1 240,50", "number"),      # thousands, everywhere else
+        ("$1,240.50", "number"),
+        ("12%", "number"),
+        ("(340)", "number"),         # accounting negative
+        ("1,5", "number"),           # decimal comma
+        ("2024-01-03", "date"),
+        ("2024-01-03 14:30", "date"),
+        ("03/01/2024", "date"),
+        ("3.1.24", "date"),
+        ("TRUE", "bool"),
+        ("false", "bool"),
+        ("EU", "text"),
+        ("nan", "text"),             # a word in a spreadsheet, not a float
+        ("inf", "text"),
+        ("2024", "number"),          # a bare year is a number, not a date
+        ("N/A", "text"),
+    ],
+)
+def test_cell_type(value, expected):
+    assert cell_type(value) == expected
+
+
+def test_guess_type_needs_agreement():
+    assert guess_type(["1", "2", "3"]) == "number"
+    assert guess_type(["1", "", "3"]) == "number"
+    assert guess_type([]) == "empty"
+    assert guess_type(["", "  "]) == "empty"
+    # A placeholder does not turn a revenue column into a mixed one...
+    assert guess_type(["1", "n/a", "3"]) == "number"
+    # ...but two real content types do.
+    assert guess_type(["1", "2024-01-03"]) == "mixed"
+
+
+def test_profile_columns_drops_the_blanks_and_keeps_the_named():
+    rows = [
+        ["Date", "", "Region", "Notes"],
+        ["2024-01-03", "", "EU"],
+        ["2024-01-04", "", "US"],
+    ]
+    columns, empty = profile_columns(rows)
+    assert [(c["letter"], c["name"], c["type"]) for c in columns] == [
+        ("A", "Date", "date"),
+        ("C", "Region", "text"),
+        ("D", "Notes", "empty"),
+    ]
+    assert empty == ["B"]
+
+
+def test_profile_columns_of_nothing():
+    assert profile_columns([]) == ([], [])
+    assert profile_columns([["", ""]]) == ([], ["A", "B"])

@@ -27,7 +27,9 @@ def drive(env):
         yield svc.files.return_value
 
 
-def test_list_sheets(service):
+@pytest.fixture
+def two_tabs(service):
+    """A spreadsheet of two tabs, properties only — what `preview: false` returns."""
     service.spreadsheets.return_value.get.return_value.execute.return_value = {
         "properties": {"title": "My doc"},
         "sheets": [
@@ -37,11 +39,135 @@ def test_list_sheets(service):
                             "gridProperties": {"rowCount": 50, "columnCount": 5}}},
         ],
     }
-    result = tools.gsheets_list_sheets({"spreadsheet_id": "SSID"})
+    return service
+
+
+def _batches(values, *payloads):
+    """Queue one batchGet response per expected round trip."""
+    values.batchGet.return_value.execute.side_effect = [
+        {"valueRanges": payload} for payload in payloads
+    ]
+
+
+def test_list_sheets_without_preview(two_tabs, values, env):
+    env(gsheets_output_format="json")
+    result = tools.gsheets_list_sheets({"spreadsheet_id": "SSID", "preview": False})
     assert result["spreadsheet_title"] == "My doc"
     assert [s["title"] for s in result["sheets"]] == ["Data", "Stats"]
     assert result["sheets"][1]["sheet_id"] == 7
     assert result["sheets"][0]["rows"] == 100
+    # The whole point of opting out: the tab list costs exactly one call.
+    values.batchGet.assert_not_called()
+
+
+def test_list_sheets_preview_profiles_every_tab_in_two_round_trips(two_tabs, values, env):
+    env(gsheets_output_format="json")
+    _batches(
+        values,
+        [
+            {"values": [["Date", "Region", "Revenue"],
+                        ["2024-01-03", "EU", "41,000"],
+                        ["2024-01-04", "US", "28,500"]]},
+            {"values": [["Metric", "Value"], ["Margin", "12%"]]},
+        ],
+        [{"values": [["Date", "2024-01-03"] + ["x"] * 4000, ["Region"], ["Revenue"]]},
+         {"values": [["Metric", "Margin"], ["Value", "12%"]]}],
+    )
+    result = tools.gsheets_list_sheets({"spreadsheet_id": "SSID"})
+
+    data = result["sheets"][0]
+    assert [c["name"] for c in data["schema"]] == ["Date", "Region", "Revenue"]
+    assert [c["type"] for c in data["schema"]] == ["date", "text", "number"]
+    assert data["sample"] == [["2024-01-03", "EU", "41,000"], ["2024-01-04", "US", "28,500"]]
+    # gridProperties says 100 rows; the probe found how far the data actually goes.
+    assert data["rows"] == 100
+    assert data["data_rows"] == 4002
+
+    # Both tabs are read in one call each way, not one call per tab.
+    assert values.batchGet.call_count == 2
+    tops, depths = values.batchGet.call_args_list
+    # Ten rows are read to type the columns, whatever the sample prints.
+    assert tops.kwargs["ranges"] == ["'Data'!1:11", "'Stats'!1:11"]
+    assert tops.kwargs["majorDimension"] == "ROWS"
+    assert depths.kwargs["ranges"] == ["'Data'!A:C", "'Stats'!A:B"]
+    assert depths.kwargs["majorDimension"] == "COLUMNS"
+
+
+def test_list_sheets_preview_leaves_out_what_is_empty(two_tabs, values, env):
+    env(gsheets_output_format="json")
+    _batches(
+        values,
+        # 'Data' has a gap at B and a named-but-unfilled column at D; 'Stats' is bare.
+        [{"values": [["Date", "", "Region", "Notes"], ["2024-01-03", "", "EU"]]}, {}],
+        [{"values": [["Date", "2024-01-03"]]}],
+    )
+    result = tools.gsheets_list_sheets({"spreadsheet_id": "SSID"})
+
+    data, stats = result["sheets"]
+    assert [c["letter"] for c in data["schema"]] == ["A", "C", "D"]
+    assert data["empty_columns"] == ["B"]
+    # The sample is trimmed to the same columns, so it still lines up with the schema.
+    assert data["sample"] == [["2024-01-03", "EU", ""]]
+    # A named column with nothing under it is structure, and says so.
+    assert data["schema"][-1] == {"letter": "D", "name": "Notes", "type": "empty"}
+
+    assert stats["empty"] is True
+    assert "schema" not in stats and "data_rows" not in stats
+    # An empty tab is not worth a second round trip to measure.
+    assert values.batchGet.call_args_list[1].kwargs["ranges"] == ["'Data'!A:C"]
+
+
+def test_list_sheets_preview_renders_as_text_by_default(two_tabs, values):
+    _batches(
+        values,
+        [{"values": [["Date", "Qty"], ["2024-01-03", "12"]]}, {}],
+        [{"values": [["Date", "2024-01-03"]]}],
+    )
+    text = tools.gsheets_list_sheets({"spreadsheet_id": "SSID"})
+    assert text.splitlines()[0] == "My doc — 2 tabs"
+    # Grid size is dropped once the real extent is known; gid stays, shorter.
+    assert "Data\tgid=0\trows~2" in text
+    assert "  A\tDate\tdate" in text
+    assert "  2024-01-03\t12" in text
+    assert "Stats\tgid=7\tgrid=50x5\tempty" in text
+
+
+def test_list_sheets_preview_types_columns_with_no_sample_at_all(two_tabs, values, env):
+    """sample_rows=0 prints no rows, and must still say what the columns hold.
+
+    Typing off the printed window made this answer 'empty' for every column — an
+    assertion that there is nothing under the header, next to a row count saying
+    there is.
+    """
+    env(gsheets_output_format="json")
+    _batches(
+        values,
+        [{"values": [["Date", "Max, °C"], ["2024-07-01", "31"], ["2024-07-02", "29"]]}, {}],
+        [{"values": [["Date"] + ["x"] * 10]}],
+    )
+    result = tools.gsheets_list_sheets({"spreadsheet_id": "SSID", "sample_rows": 0})
+
+    data = result["sheets"][0]
+    assert [c["type"] for c in data["schema"]] == ["date", "number"]
+    assert data["sample"] == []
+    assert data["data_rows"] == 11
+    # The rows that did the typing were read, just not printed.
+    assert values.batchGet.call_args_list[0].kwargs["ranges"] == ["'Data'!1:11", "'Stats'!1:11"]
+
+
+def test_list_sheets_preview_honours_sample_rows(two_tabs, values, env):
+    env(gsheets_output_format="json")
+    _batches(values, [{}, {}], [])
+    tools.gsheets_list_sheets({"spreadsheet_id": "SSID", "sample_rows": 500})
+    # Capped, and the range asks for one more row than the sample: the header.
+    ranges = values.batchGet.call_args_list[0].kwargs["ranges"]
+    assert ranges == ["'Data'!1:21", "'Stats'!1:21"]
+
+
+def test_list_sheets_preview_accepts_a_stringy_flag(two_tabs, values, env):
+    env(gsheets_output_format="json")
+    tools.gsheets_list_sheets({"spreadsheet_id": "SSID", "preview": "false"})
+    values.batchGet.assert_not_called()
 
 
 def test_read_sheet_quotes_the_tab_name(values, env):
@@ -752,4 +878,40 @@ def test_allowlist_permits_a_listed_spreadsheet(service, env):
     service.spreadsheets.return_value.get.return_value.execute.return_value = {
         "properties": {"title": "t"}, "sheets": [],
     }
+    env(gsheets_output_format="json")
     assert tools.gsheets_list_sheets({"spreadsheet_id": "OK_ID"})["spreadsheet_title"] == "t"
+
+
+def test_list_sheets_preview_survives_a_chart_only_tab(service, values):
+    """A chart on its own tab is an OBJECT sheet: it has no grid to profile."""
+    service.spreadsheets.return_value.get.return_value.execute.return_value = {
+        "properties": {"title": "My doc"},
+        "sheets": [{"properties": {"title": "Chart 1", "sheetId": 4, "index": 0}}],
+    }
+    text = tools.gsheets_list_sheets({"spreadsheet_id": "SSID"})
+    assert text.splitlines()[-1] == "Chart 1\tgid=4"
+    values.batchGet.assert_not_called()
+
+
+def test_list_sheets_preview_flags_a_footer_under_the_table(two_tabs, values):
+    """A blank row with content under it is a totals line, not more data."""
+    _batches(
+        values,
+        [{"values": [["Date", "Qty"], ["2024-07-01", "12"]]}, {}],
+        # Rows 2-8 are the table, 9 is blank, 10 is a 'Total' line below it.
+        [{"values": [["Date", "a", "b", "c", "d", "e", "f", "g", "", "Total"]]}],
+    )
+    text = tools.gsheets_list_sheets({"spreadsheet_id": "SSID"})
+    assert "Data\tgid=0\trows~10\t(gap at 9)" in text
+
+
+def test_list_sheets_reports_charts_without_a_second_call(two_tabs, values):
+    two_tabs.spreadsheets.return_value.get.return_value.execute.return_value["sheets"][0][
+        "charts"
+    ] = [{"chartId": 11}, {"chartId": 12}]
+    _batches(values, [{}, {}], [])
+    text = tools.gsheets_list_sheets({"spreadsheet_id": "SSID"})
+    assert "Data\tgid=0\tgrid=100x20\tempty\tcharts=2" in text
+    # The chart ids ride along in the properties request, which was happening anyway.
+    fields = two_tabs.spreadsheets.return_value.get.call_args.kwargs["fields"]
+    assert fields == "properties.title,sheets(properties,charts.chartId)"

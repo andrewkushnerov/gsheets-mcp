@@ -26,6 +26,7 @@ from .formatting import (
     a1_to_grid_range,
     column_letters,
     parse_color,
+    profile_columns,
     rows_to_tsv,
     window_a1,
 )
@@ -95,6 +96,21 @@ def _whole_number(args: dict, key: str, default: int) -> int:
     if number < 0:
         raise ValueError(f"'{key}' must be 0 or more, got {number}")
     return number
+
+
+def _boolean(args: dict, key: str, default: bool) -> bool:
+    """An optional boolean argument. Models pass "false" as often as False."""
+    value = args.get(key)
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "yes", "1"):
+            return True
+        if text in ("false", "no", "0"):
+            return False
+        raise ValueError(f"'{key}' must be true or false, got {value!r}")
+    return bool(value)
 
 
 def _input_option(args: dict) -> str:
@@ -291,40 +307,247 @@ def gsheets_find_spreadsheets(args: dict) -> dict:
     return payload
 
 
+#: Sample rows shown per tab under preview, and the ceiling on the argument. The
+#: sample is there to show the shape of a row, not to be read as data — reading is
+#: what gsheets_read_sheet is for, and it pages.
+_PREVIEW_SAMPLE_ROWS = 3
+_PREVIEW_MAX_SAMPLE_ROWS = 20
+
+#: Rows a column's type is inferred from, whatever ``sample_rows`` asks to be shown.
+#: The two are deliberately separate: a type is a claim about the column, so tying it
+#: to the print window makes ``sample_rows=0`` answer "empty" — which reads as "there
+#: is nothing under this header" — to a question that was never asked. These rows cost
+#: bandwidth on a request already being made, and nothing at all in context.
+_PREVIEW_INFER_ROWS = 10
+
+#: Columns the row-count probe reads. One column lies whenever the leading one is
+#: sparse, and the whole table is a download of the thing we are trying not to
+#: download. Three is the compromise, and why the count is reported as approximate.
+_PROBE_COLUMNS = 3
+
+_PREVIEW_PROP = {
+    "type": "boolean",
+    "description": "Default true. false gives the bare tab list, for one API call "
+                   "instead of three.",
+}
+_SAMPLE_ROWS_PROP = {
+    "type": "integer",
+    "minimum": 0,
+    "description": "Sample rows printed per tab (default "
+                   f"{_PREVIEW_SAMPLE_ROWS}, max {_PREVIEW_MAX_SAMPLE_ROWS}). 0 prints "
+                   "none and still names and types every column — the cheapest way to "
+                   "survey a wide document.",
+}
+
+
 @mcp_tool(
     "gsheets_list_sheets",
-    "List all sheets (tabs) of a Google Spreadsheet: title, sheet_id, index, grid size. "
-    "Use this first to discover tab names.",
+    "A spreadsheet's tabs, each one profiled: its real row count, one line per column "
+    "(letter, name, inferred type), and a few sample rows. Start here — it answers "
+    "'what is in this document' without reading a tab. Empty tabs and blank unnamed "
+    "columns are left out; a column typed `empty` is named but blank in the rows "
+    "sampled. `(gap at N)`: row N is blank with content below it, so a footer rather "
+    "than data. Counts and types come from a sample — treat them as hints, not facts. "
+    "preview=false gives a bare tab list.",
     {
         "type": "object",
-        "properties": {"spreadsheet_id": _SPREADSHEET_ID_PROP},
+        "properties": {
+            "spreadsheet_id": _SPREADSHEET_ID_PROP,
+            "preview": _PREVIEW_PROP,
+            "sample_rows": _SAMPLE_ROWS_PROP,
+        },
         "required": ["spreadsheet_id"],
     },
 )
-def gsheets_list_sheets(args: dict) -> dict:
+def gsheets_list_sheets(args: dict) -> dict | str:
     spreadsheet_id = _spreadsheet_id(args)
     service = get_sheets_service()
     meta = _execute(
         service.spreadsheets().get(
-            spreadsheetId=spreadsheet_id, fields="properties.title,sheets.properties"
+            spreadsheetId=spreadsheet_id,
+            fields="properties.title,sheets(properties,charts.chartId)",
         ),
         spreadsheet_id,
     )
-    return {
-        "spreadsheet_title": meta.get("properties", {}).get("title"),
-        "sheets": [
-            {
-                "title": p.get("title"),
-                "sheet_id": p.get("sheetId"),
-                "index": p.get("index"),
-                "rows": p.get("gridProperties", {}).get("rowCount"),
-                "columns": p.get("gridProperties", {}).get("columnCount"),
-                "hidden": p.get("hidden", False),
-            }
-            for sheet in meta.get("sheets", [])
-            for p in [sheet.get("properties", {})]
-        ],
-    }
+    sheets = [
+        {
+            "title": p.get("title"),
+            "sheet_id": p.get("sheetId"),
+            "index": p.get("index"),
+            "rows": p.get("gridProperties", {}).get("rowCount"),
+            "columns": p.get("gridProperties", {}).get("columnCount"),
+            "hidden": p.get("hidden", False),
+            # Cheap here, and it is what stops a second chart being drawn over the
+            # first when the same request comes round again.
+            "charts": len(sheet.get("charts") or []),
+        }
+        for sheet in meta.get("sheets", [])
+        for p in [sheet.get("properties", {})]
+    ]
+    if _boolean(args, "preview", True):
+        sample_rows = min(
+            _whole_number(args, "sample_rows", _PREVIEW_SAMPLE_ROWS),
+            _PREVIEW_MAX_SAMPLE_ROWS,
+        )
+        _preview_sheets(service, spreadsheet_id, sheets, sample_rows)
+    return _render_sheets(
+        {"spreadsheet_title": meta.get("properties", {}).get("title"), "sheets": sheets}
+    )
+
+
+def _batch_values(service, spreadsheet_id: str, ranges: list[str], major: str) -> list[dict]:
+    """``values.batchGet`` -> one valueRange per requested range, in order."""
+    result = _execute(
+        service.spreadsheets().values().batchGet(
+            spreadsheetId=spreadsheet_id, ranges=ranges, majorDimension=major
+        ),
+        spreadsheet_id,
+    )
+    parts = result.get("valueRanges") or []
+    # Google answers range for range, but a short list would silently pair one tab
+    # with another tab's data. Pad rather than let zip() shift everything by one.
+    return parts + [{}] * (len(ranges) - len(parts))
+
+
+def _probe_span(kept: list[int], column_count) -> str:
+    """The A1 column span the row-count probe reads: the first few live columns.
+
+    Bounded on both sides by columns that hold something — a table starting at C is
+    not measured by the two blank columns to its left, and a two-column table is not
+    measured by a third that the profile already found empty.
+    """
+    first, last = kept[0], min(kept[0] + _PROBE_COLUMNS - 1, kept[-1])
+    if column_count:
+        last = min(last, max(int(column_count) - 1, first))
+    return f"{column_letters(first)}:{column_letters(last)}"
+
+
+def _preview_sheets(service, spreadsheet_id: str, sheets: list[dict], sample_rows: int) -> None:
+    """Fill in each tab's real shape, in place.
+
+    Two batched round trips for the whole document however many tabs it has: one
+    reads the top of every sheet, one measures how far the data goes down. A read
+    per tab is the behaviour this preview exists to stop, so it would be a poor way
+    to implement it.
+
+    The depth probe is a second trip rather than part of the first because the two
+    want different ``majorDimension`` values, and which columns are worth probing is
+    only known once the first has come back.
+    """
+    grids = [s for s in sheets if s["rows"] and s["columns"]]
+    if not grids:
+        return
+
+    # Read enough to type the columns even when none are to be printed.
+    read_rows = max(sample_rows, _PREVIEW_INFER_ROWS)
+    tops = _batch_values(
+        service,
+        spreadsheet_id,
+        [f"{_quote_sheet(s['title'])}!1:{read_rows + 1}" for s in grids],
+        "ROWS",
+    )
+
+    probes: list[tuple[dict, str]] = []
+    for sheet, part in zip(grids, tops):
+        rows = part.get("values") or []
+        columns, empty = profile_columns(rows)
+        if not columns:
+            sheet["empty"] = True
+            continue
+        kept = [column["index"] for column in columns]
+        sheet["schema"] = [
+            {key: column[key] for key in ("letter", "name", "type")} for column in columns
+        ]
+        if empty:
+            sheet["empty_columns"] = empty
+        # The sample is trimmed to the same columns as the schema, so the two line up
+        # field for field; a row left blank by that trim is not worth showing either.
+        # Only the rows asked for are printed — the rest were read to infer the types.
+        shown = rows[1 : sample_rows + 1]
+        sample = [[_cell(row, index) for index in kept] for row in shown]
+        sheet["sample"] = [row for row in sample if any(str(cell).strip() for cell in row)]
+        probes.append((sheet, _probe_span(kept, sheet["columns"])))
+
+    if not probes:
+        return
+    depths = _batch_values(
+        service,
+        spreadsheet_id,
+        [f"{_quote_sheet(sheet['title'])}!{span}" for sheet, span in probes],
+        "COLUMNS",
+    )
+    for (sheet, _), part in zip(probes, depths):
+        # A column arrives trimmed of its trailing empties, so its length is the last
+        # row that column reaches. The deepest of the probed columns is the estimate.
+        columns = part.get("values") or []
+        sheet["data_rows"] = max((len(column) for column in columns), default=0)
+        gap = _first_gap(columns, sheet["data_rows"])
+        if gap:
+            sheet["gap_at"] = gap
+
+
+def _first_gap(columns: list[list], depth: int) -> int | None:
+    """The first blank row inside the probed columns, 1-based, or None.
+
+    A row count alone cannot tell a 900-row table from an 800-row table with a
+    totals line and a note under it, and reading to the count swallows the footer
+    into the data. The columns are already in hand and trimmed of their trailing
+    blanks, so anything blank above ``depth`` has content below it: that is a break,
+    and saying where it is costs a comparison per row and nothing on the wire.
+    """
+    for index in range(depth):
+        if all(not str(_cell(column, index)).strip() for column in columns):
+            return index + 1
+    return None
+
+
+def _cell(row: list, index: int):
+    return row[index] if index < len(row) else ""
+
+
+def _render_sheets(payload: dict) -> dict | str:
+    """The tab list in whichever wire format ``GSHEETS_OUTPUT_FORMAT`` asks for.
+
+    The same trade as :func:`_render_grid`, and it bites harder here: as JSON every
+    profiled column spends a pair of braces and three quoted keys to say what one
+    tab-separated line says, on every column of every tab.
+    """
+    if get_settings().gsheets_output_format == "json":
+        return payload
+
+    sheets = payload["sheets"]
+    plural = "" if len(sheets) == 1 else "s"
+    lines = [f"{payload['spreadsheet_title']} — {len(sheets)} tab{plural}"]
+    for sheet in sheets:
+        # gid, not sheet_id: no tool takes one as an argument, and the only thing
+        # left to do with it is paste it into the #gid= fragment of a tab's URL.
+        head = [str(sheet["title"]), f"gid={sheet['sheet_id']}"]
+        if sheet.get("data_rows"):
+            head.append(f"rows~{sheet['data_rows']}")
+            if sheet.get("gap_at"):
+                head.append(f"(gap at {sheet['gap_at']})")
+        elif sheet["rows"] and sheet["columns"]:
+            # Once the real extent is known the grid is just the container it sits
+            # in. It is the only size there is for an empty tab, or with preview off.
+            # A chart on its own tab is an OBJECT sheet and has no grid at all.
+            head.append(f"grid={sheet['rows']}x{sheet['columns']}")
+        if sheet.get("empty"):
+            head.append("empty")
+        if sheet.get("charts"):
+            head.append(f"charts={sheet['charts']}")
+        if sheet.get("hidden"):
+            head.append("hidden")
+        lines += ["", "\t".join(head)]
+
+        for column in sheet.get("schema") or []:
+            named = column["name"] or "-"
+            lines.append("  " + "\t".join([column["letter"], named, column["type"]]))
+        if sheet.get("empty_columns"):
+            lines.append("  empty columns: " + ", ".join(sheet["empty_columns"]))
+        if sheet.get("sample"):
+            lines.append("  sample:")
+            lines += ["  " + line for line in rows_to_tsv(sheet["sample"]).split("\n")]
+    return "\n".join(lines)
 
 
 def _render_grid(payload: dict) -> dict | str:
@@ -367,7 +590,9 @@ def _render_grid(payload: dict) -> dict | str:
     "escaped to a literal \\t or \\n. (With GSHEETS_OUTPUT_FORMAT=json the same data "
     "comes back as a JSON 2D array instead.) Big sheets come back a page at a time: when "
     "the `rows:` line names a follow-up offset, call again with it to get the next page. "
-    "Pass `range` to read only part of the sheet.",
+    "Pass `range` to read only part of the sheet. A whole tab is rarely what you want: "
+    "gsheets_list_sheets already gives you the column names, their types and a sample, "
+    "so reach for `range` or a small `limit` unless you genuinely need every row.",
     {
         "type": "object",
         "properties": {

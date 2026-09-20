@@ -52,8 +52,13 @@ _SEARCH = (
     "gsheets_find_spreadsheets looks the id up in Drive by name."
 )
 _FLOW = (
-    "Typical flow: gsheets_list_sheets to discover the tabs, gsheets_read_sheet to read "
-    "one tab as a 2D array, gsheets_append_rows to add rows at the bottom, "
+    "Typical flow: gsheets_list_sheets first. It does not just name the tabs — it "
+    "profiles each one: the columns and their types, a few sample rows, and roughly "
+    "how far the data goes down. That is usually enough to answer a question about "
+    "what a document holds, and to aim the next call, without reading a tab at all. "
+    "Then gsheets_read_sheet for the rows you actually need, as a 2D array and a page "
+    "at a time — reading whole tabs to find out what is in them is the one thing that "
+    "will not fit. gsheets_append_rows to add rows at the bottom, "
     "gsheets_update_sheet to write (omit `range` to replace the whole tab; pass a range "
     "like 'B2' for a partial update), gsheets_add_sheet / gsheets_delete_sheet to manage "
     "tabs, gsheets_format_cells to colour or bold cells without touching their values, "

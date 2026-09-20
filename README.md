@@ -161,7 +161,7 @@ Put the HTTP server behind HTTPS (Caddy, nginx, Traefik), set `MCP_AUTH_TOKEN`, 
 
 | Tool | Writes | What it does |
 |---|:---:|---|
-| `gsheets_list_sheets` | no | Tabs of a spreadsheet: title, `sheet_id`, index, grid size. Start here. |
+| `gsheets_list_sheets` | no | Tabs of a spreadsheet, each one profiled: columns, types, sample rows, real row count. Start here. |
 | `gsheets_read_sheet` | no | One tab as a tab-separated grid (or JSON, see `GSHEETS_OUTPUT_FORMAT`). Optional A1 `range`, paged with `offset`/`limit`. |
 | `gsheets_append_rows` | yes | Adds rows below the last non-empty one. Nothing is overwritten. |
 | `gsheets_update_sheet` | destructive | With `range`, a partial update anchored at that cell. Without one, replaces the whole tab. |
@@ -179,6 +179,45 @@ https://docs.google.com/spreadsheets/d/<spreadsheet_id>/edit
 ```
 
 A full replace (`gsheets_update_sheet` with no `range`) clears the *values* and rewrites them, so formatting, conditional rules and the tab itself survive.
+
+### Looking at a document first
+
+`gsheets_list_sheets` does not just name the tabs. It profiles each one, so the answer to "what is in this spreadsheet" costs a single call instead of a read per tab:
+
+```
+Q3 ops — 3 tabs
+
+Orders	gid=0	rows~18432	(gap at 18420)	charts=1
+  A	Date	date
+  B	Region	text
+  D	Revenue	number
+  E	Paid	bool
+  F	Notes	empty
+  empty columns: C
+  sample:
+  2024-07-01	EU	$41,000.00	TRUE	
+  2024-07-02	US	$28,500.00	FALSE	
+
+Scratch	gid=3	grid=1000x26	empty
+```
+
+Four things there, none of which are in the grid metadata Google hands out.
+
+**`rows~18432` is the data, not the grid.** `gridProperties.rowCount` counts the sheet, which is why a blank tab claims a thousand rows. The real extent is measured by reading the first few populated columns and seeing where they stop — the columns arrive trimmed of their trailing blanks, so their length *is* the answer. Hence the `~`: a table whose leading columns are sparse reads short, and the number is a hint for planning a read, not a figure to quote at anyone.
+
+**`(gap at 18420)` is the trap that number sets.** A row count cannot tell an 18,419-row table from an 18,418-row one with a blank line and a totals row under it, and a read that trusts the count swallows the footer into the data. Anything blank *above* the last populated row has content below it, so it is a break rather than an end — the probed columns are already in hand, so finding the first one costs a comparison per row and nothing on the wire. No `(gap at …)` means the block really is contiguous.
+
+**Empty things are left out.** A tab with nothing in it says `empty` and stops there. A column blank top to bottom and unnamed is dropped, with its letter noted on the `empty columns:` line so nothing disappears silently — and the sample rows are trimmed to the same columns, so they still line up with the list above them. A column that *is* named but has nothing under it is kept and typed `empty`: somebody meant it to be there, and it is where the next write goes.
+
+**Types are inferred, and not from the rows you see.** The Sheets API returns every cell as the string it displays, so `$41,000.00`, `1 240,50` and `12%` all have to be recognised as numbers by undoing that formatting. A column that cannot make up its mind comes back as `mixed`. The ten rows that do the inferring are read whatever `sample_rows` says, because a type is a claim about the column: tie it to the print window and `sample_rows: 0` answers `empty` — "there is nothing under this header" — to a question nobody asked. Those rows cost bandwidth on a request already being made, and nothing at all in context.
+
+**The tab line carries only what you can act on.** `gid` rather than `sheet_id`, because no tool takes one as an argument — the only thing left to do with it is paste it into the `#gid=` fragment of a tab's URL, and the shorter name says so. The grid size is dropped once the real extent is known, and shown only when it is the only size there is: an empty tab, or `preview: false`. `charts=1` costs three tokens and is what stops a second chart being drawn on top of the first.
+
+Two arguments: `sample_rows` and `preview: false`.
+
+`sample_rows` is how many rows get *printed* (default 3, max 20). **`0` is the cheapest useful setting on a wide document**: letters, names and types are most of what it takes to aim a `range`, and for thirty tabs that is roughly 1,800 tokens against 3,600. Raise it when the headers are vague (`col1`, `Unnamed: 3`) or you need to see how the dates and numbers are actually written.
+
+`preview: false` gives the bare tab list for one API call instead of three. Preview costs three because one call fetches properties, one the top of every tab, and one the depth probe — batched across the whole document, so the count does not grow with the number of tabs.
 
 ### Reading a big tab
 
@@ -253,7 +292,7 @@ All settings are environment variables, read from `.env` if it's there. Every on
 | `GSHEETS_READ_ONLY` | `false` | `true` and the write tools aren't registered at all. |
 | `GSHEETS_ALLOWED_SPREADSHEETS` | — | Comma-separated ids. Empty means anything the Google identity can open. |
 | `GSHEETS_MAX_READ_ROWS` | `5000` | Page size for reads, and the ceiling on `limit`. `0` is unlimited and disables paging. |
-| `GSHEETS_OUTPUT_FORMAT` | `tsv` | Sheet contents as a tab-separated grid, or `json` for a 2D array. TSV costs roughly half the tokens. |
+| `GSHEETS_OUTPUT_FORMAT` | `tsv` | Sheet contents and the tab list as tab-separated text, or `json` for structured output. TSV costs roughly half the tokens. |
 | `GSHEETS_ENABLE_DRIVE_SEARCH` | `false` | `true` registers `gsheets_find_spreadsheets` and asks for the Drive scope. |
 | `LOG_LEVEL` | `INFO` | Standard Python levels. |
 
