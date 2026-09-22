@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.1 — 2026-09-22
+
+A first step towards tabs too big to read whole: read the columns a question needs
+rather than every row, and a fixture large enough to make that matter.
+
+### Added
+
+- `columns` on `gsheets_read_sheet` — letters, or spans like `A:D`, of the columns
+  to read instead of whole rows. Each is its own bounded range in a single
+  `batchGet`, read column-major and stitched into rows on the server, so the call
+  costs one round trip however many columns it names. Paging is unchanged: `offset`
+  and `limit` address the rows, the header rides along on page two as before, and
+  the response opens with `columns: G, H, O` so the grid stays labelled. On the
+  24-column settlement report below a row costs about a dozen tokens instead of
+  ninety. One caveat, stated in the tool's description: the API trims a column's
+  trailing blanks, so a page is as tall as the tallest column asked for, and a
+  sparse column requested on its own reads shorter than the tab.
+- `scripts/generate_amazon_settlement.py`, and the two files it writes to
+  `tests/fixtures/`: a synthetic Amazon settlement report — the real report's 24
+  columns and row grammar, several lines per order and several items per order,
+  fees, tax, promotions, refunds, reserves — over an invented catalogue and invented
+  ids. The 5k-line one is just over a default `GSHEETS_MAX_READ_ROWS` page, so a
+  whole-tab read has to page exactly once; the 50k-line one is ten pages. Both are
+  deterministic per seed, and `--rows N --out file` writes one of any size.
+
+### Changed
+
+- `include_header` is parsed like the other flags: `"false"` from a model now turns
+  the repeated header off, and a value that is neither true nor false is an error
+  rather than a silent true.
+
 ## 0.4.0 — 2026-09-20
 
 ### Added

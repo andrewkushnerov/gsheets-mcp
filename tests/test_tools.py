@@ -376,6 +376,102 @@ def test_read_sheet_tsv_of_an_empty_sheet_is_just_the_header(values):
     assert result == "rows: 0"
 
 
+def test_read_sheet_columns_asks_for_just_those_columns(values, env):
+    env(gsheets_max_read_rows=2, gsheets_output_format="json")
+    values.batchGet.return_value.execute.return_value = {"valueRanges": [
+        {"range": "'Data'!G1:G3", "values": [["type", "Order", "Refund"]]},
+        {"range": "'Data'!O1:O3", "values": [["amount", "7.99", "-7.99"]]},
+    ]}
+    result = tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "columns": ["G", "O"]}
+    )
+    # One round trip, one bounded range per column, column-major so each comes back
+    # as a list; the third row of each is the has-more probe.
+    values.batchGet.assert_called_once_with(
+        spreadsheetId="SSID", ranges=["'Data'!G1:G3", "'Data'!O1:O3"], majorDimension="COLUMNS"
+    )
+    values.get.assert_not_called()
+    assert result["columns"] == ["G", "O"]
+    assert result["values"] == [["type", "amount"], ["Order", "7.99"]]
+    assert result["row_count"] == 2
+    assert result["next_offset"] == 2
+
+
+def test_read_sheet_columns_pads_a_column_that_stops_early(values, env):
+    """The API trims a column's trailing blanks; the grid must stay rectangular."""
+    env(gsheets_output_format="json")
+    values.batchGet.return_value.execute.return_value = {"valueRanges": [
+        {"values": [["sku", "A-1", "A-2"]]},
+        {"values": [["promo", "S&S"]]},
+        {},
+    ]}
+    result = tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "columns": ["V", "X", "Z"]}
+    )
+    assert result["values"] == [["sku", "promo", ""], ["A-1", "S&S", ""], ["A-2", "", ""]]
+
+
+def test_read_sheet_columns_page_two_repeats_the_header_in_the_same_trip(values, env):
+    env(gsheets_max_read_rows=2, gsheets_output_format="json")
+    values.batchGet.return_value.execute.return_value = {"valueRanges": [
+        {"values": [["type"]]}, {"values": [["amount"]]},
+        {"values": [["Order", "Order"]]}, {"values": [["1.00", "2.00"]]},
+    ]}
+    result = tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "columns": "G,O", "offset": 2}
+    )
+    values.batchGet.assert_called_once_with(
+        spreadsheetId="SSID",
+        ranges=["'Data'!G1:G1", "'Data'!O1:O1", "'Data'!G3:G5", "'Data'!O3:O5"],
+        majorDimension="COLUMNS",
+    )
+    assert result["header_row"] is True
+    assert result["values"] == [["type", "amount"], ["Order", "1.00"], ["Order", "2.00"]]
+    assert result["row_count"] == 2
+    assert "next_offset" not in result
+
+
+def test_read_sheet_columns_take_spans_and_ignore_repeats(values, env):
+    env(gsheets_max_read_rows=0, gsheets_output_format="json")
+    values.batchGet.return_value.execute.return_value = {"valueRanges": []}
+    result = tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "columns": ["b:d", "F", "c"]}
+    )
+    # No cap means no probe row and an open-ended column, which A1 can spell.
+    values.batchGet.assert_called_once_with(
+        spreadsheetId="SSID",
+        ranges=["'Data'!B1:B", "'Data'!C1:C", "'Data'!D1:D", "'Data'!F1:F"],
+        majorDimension="COLUMNS",
+    )
+    assert result["columns"] == ["B", "C", "D", "F"]
+    assert result["values"] == []
+
+
+def test_read_sheet_columns_do_not_mix_with_a_range(values):
+    with pytest.raises(ValueError, match="not both"):
+        tools.gsheets_read_sheet(
+            {"spreadsheet_id": "SSID", "sheet_name": "Data", "columns": ["A"], "range": "A1:C5"}
+        )
+    values.batchGet.assert_not_called()
+
+
+@pytest.mark.parametrize("bad", [["G1"], ["A:"], [""], "A;B", 7])
+def test_read_sheet_columns_must_be_letters(values, bad):
+    with pytest.raises(ValueError):
+        tools.gsheets_read_sheet({"spreadsheet_id": "SSID", "sheet_name": "Data", "columns": bad})
+    values.batchGet.assert_not_called()
+
+
+def test_read_sheet_columns_tsv_names_the_columns(values):
+    values.batchGet.return_value.execute.return_value = {"valueRanges": [
+        {"values": [["sku", "A-1"]]}, {"values": [["amount", "7.99"]]},
+    ]}
+    result = tools.gsheets_read_sheet(
+        {"spreadsheet_id": "SSID", "sheet_name": "Data", "columns": ["V", "O"]}
+    )
+    assert result == "columns: V, O\nrows: 2\n\nsku\tamount\nA-1\t7.99"
+
+
 def test_update_full_replace_clears_then_appends(values):
     values.append.return_value.execute.return_value = {
         "updates": {"updatedRange": "'Data'!A1:B2", "updatedRows": 2,

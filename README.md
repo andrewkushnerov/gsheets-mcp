@@ -236,6 +236,15 @@ rows: 5000 from offset 5000 (+ the header row repeated above them); more follow 
 
 Pass `include_header: false` to turn that off, or `limit` to ask for a smaller page. `limit` cannot exceed the server's cap; that is the point of the cap.
 
+**On a wide tab, ask for columns.** `columns: ["G", "H", "O"]` reads only those columns — the letters `gsheets_list_sheets` printed; a span like `"A:D"` works too — and stitches them into rows, so a row of the 24-column settlement fixture costs a dozen tokens instead of about ninety. It is one round trip whatever the number of columns. Rows are still paged with `offset` and `limit`, and page two still carries the header:
+
+```
+columns: G, H, O
+rows: 5000; more follow — call again with offset=5000
+```
+
+One thing to know: the API trims a column's trailing blanks, so the page is as tall as the tallest column asked for. Ask for a sparse column on its own and the tab reads shorter than it is.
+
 ### Colouring cells
 
 `gsheets_format_cells` takes a list of A1 ranges and one look to apply to all of them, so "paint every delivered row green" is one call rather than forty:
@@ -364,6 +373,14 @@ Run them with `python -m` rather than bare `pytest`: nothing is installed, so th
 repo root only reaches `sys.path` because `-m` puts it there.
 
 Tests mock the Sheets service, so the suite runs offline. `tests/test_protocol.py` covers the JSON-RPC surface, `tests/test_http.py` the transport and auth, `tests/test_tools.py` the tools themselves, and `tests/test_formatting.py` the A1, colour, paging-window and TSV rendering — that one touches nothing, so it can afford to be exhaustive.
+
+Two big, realistic sheets to try the server against:
+
+```bash
+python scripts/generate_amazon_settlement.py    # → tests/fixtures/amazon_settlement_test_{5k,50k}.txt
+```
+
+They have the shape of Amazon's settlement report — 24 columns, a line per money movement, several per order — over a made-up catalogue and made-up ids, tab-separated like the real download. The 5k one is a whisker over the default `GSHEETS_MAX_READ_ROWS` page, so a whole-tab read has to page exactly once, and it still costs about half a million tokens read raw; the 50k one is ten pages and close to five million. Import one into a spreadsheet (File → Import) and point the server at it. `--rows N --out file` writes one of any size (`.csv` gets commas), `--seed` reshuffles it.
 
 Poke at a running server by hand:
 

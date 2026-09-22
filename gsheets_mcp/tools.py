@@ -18,13 +18,16 @@ what you explicitly shared.
 from __future__ import annotations
 
 import json
+import re
 
 from .config import get_settings
 from .formatting import (
     EMPTY_WINDOW,
     PALETTE,
     a1_to_grid_range,
+    column_index,
     column_letters,
+    column_window_a1,
     parse_color,
     profile_columns,
     rows_to_tsv,
@@ -118,6 +121,36 @@ def _input_option(args: dict) -> str:
     if option not in ("USER_ENTERED", "RAW"):
         raise ValueError("'value_input_option' must be USER_ENTERED or RAW")
     return option
+
+
+_COLUMN_LETTERS = re.compile(r"^[A-Z]{1,3}$")
+
+
+def _column_letters(args: dict) -> list[str]:
+    """``columns`` -> its letters, in the order given, each once; ``[]`` when absent.
+
+    A list or a comma-separated string, of letters or of spans like ``'G:K'``: what
+    a model writes after reading the column list gsheets_list_sheets printed.
+    """
+    raw = args.get("columns")
+    if raw is None or raw == "" or raw == []:
+        return []
+    items = raw.split(",") if isinstance(raw, str) else raw
+    if not isinstance(items, list):
+        raise ValueError("'columns' must be a list of column letters, e.g. [\"A\", \"C\", \"F\"]")
+    letters: list[str] = []
+    for item in items:
+        first, sep, last = str(item).strip().upper().partition(":")
+        if not _COLUMN_LETTERS.match(first) or (sep and not _COLUMN_LETTERS.match(last)):
+            raise ValueError(
+                f"'{item}' is not a column: give letters (A, C, AA) or a span of them (G:K)"
+            )
+        low, high = column_index(first), column_index(last) if sep else column_index(first)
+        for index in range(min(low, high), max(low, high) + 1):
+            letter = column_letters(index)
+            if letter not in letters:
+                letters.append(letter)
+    return letters
 
 
 def _execute(request, spreadsheet_id: str | None = None):
@@ -565,6 +598,8 @@ def _render_grid(payload: dict) -> dict | str:
         return payload
 
     head = []
+    if payload.get("columns"):
+        head.append("columns: " + ", ".join(payload["columns"]))
     if payload.get("range"):
         head.append(f"range: {payload['range']}")
 
@@ -590,9 +625,11 @@ def _render_grid(payload: dict) -> dict | str:
     "escaped to a literal \\t or \\n. (With GSHEETS_OUTPUT_FORMAT=json the same data "
     "comes back as a JSON 2D array instead.) Big sheets come back a page at a time: when "
     "the `rows:` line names a follow-up offset, call again with it to get the next page. "
-    "Pass `range` to read only part of the sheet. A whole tab is rarely what you want: "
+    "Pass `range` to read only part of the sheet, or `columns` to read only the columns a "
+    "question needs (letters from gsheets_list_sheets), stitched into rows — on a wide tab "
+    "a fraction of the cost of full rows. A whole tab is rarely what you want: "
     "gsheets_list_sheets already gives you the column names, their types and a sample, "
-    "so reach for `range` or a small `limit` unless you genuinely need every row.",
+    "so reach for `columns`, `range` or a small `limit` unless you genuinely need every cell.",
     {
         "type": "object",
         "properties": {
@@ -603,6 +640,15 @@ def _render_grid(payload: dict) -> dict | str:
                 "description": "Optional A1 range within the sheet, e.g. 'A1:C50'. "
                                "Omit to read the whole sheet. `offset` and `limit` "
                                "page within this range.",
+            },
+            "columns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Column letters to read, in the order you want them, e.g. "
+                               "[\"G\", \"H\", \"O\"]; a span like \"A:D\" works too. Only "
+                               "these columns come back, paged with `offset`/`limit` "
+                               "(not `range`). The page is as tall as the tallest column "
+                               "asked for, so a lone sparse column reads short.",
             },
             "offset": {
                 "type": "integer",
@@ -650,6 +696,17 @@ def read_grid(args: dict) -> dict:
     if cap:
         limit = min(limit, cap) if limit else cap
 
+    letters = _column_letters(args)
+    if letters:
+        if cell_range:
+            raise ValueError(
+                "give `range` or `columns`, not both — with `columns`, address rows with "
+                "`offset` and `limit`"
+            )
+        return _read_columns(
+            spreadsheet_id, sheet, letters, offset, limit, _boolean(args, "include_header", True)
+        )
+
     # Ask for one row more than the page. If it comes back there is a next page —
     # learned from the same request, with no second call and no guess at the
     # sheet's real height (gridProperties counts the grid, not the data).
@@ -666,7 +723,7 @@ def read_grid(args: dict) -> dict:
     if window != EMPTY_WINDOW:
         service = get_sheets_service()
         ref = sheet + (f"!{fetch}" if fetch else "")
-        if offset and args.get("include_header", True):
+        if offset and _boolean(args, "include_header", True):
             # Page 2 of a headerless grid is a table the model has to guess at. The
             # header rides along in the same round trip rather than costing a call.
             batch = _execute(
@@ -701,6 +758,48 @@ def read_grid(args: dict) -> dict:
     covered = window_a1(echoed, 0, len(values)) if values and echoed else None
     payload = {
         "range": f"{sheet}!{covered}" if covered else result.get("range"),
+        "offset": offset,
+        "row_count": len(values),
+        "values": header_rows + values,
+    }
+    if header_rows:
+        payload["header_row"] = True
+    if next_offset is not None:
+        payload["next_offset"] = next_offset
+    return payload
+
+
+def _read_columns(spreadsheet_id: str, sheet: str, letters: list[str], offset: int,
+                  limit: int, include_header: bool) -> dict:
+    """The columns-only read: one bounded request however many columns, stitched into rows.
+
+    Each column is its own range in a single ``batchGet``, read column-major, so the
+    stitching is a transpose of what comes back. The API trims a column's trailing
+    blanks, so the page is as tall as the tallest column asked for: the honest
+    height of *these* columns, which for a sparse one is shorter than the tab.
+    """
+    probe = limit + 1 if limit else None
+    page = [f"{sheet}!{column_window_a1(letter, offset, probe)}" for letter in letters]
+    header = []
+    if offset and include_header:
+        header = [f"{sheet}!{column_window_a1(letter, 0, 1)}" for letter in letters]
+    parts = _batch_values(get_sheets_service(), spreadsheet_id, header + page, "COLUMNS")
+
+    def stitch(parts: list[dict]) -> list[list]:
+        columns = [(part.get("values") or [[]])[0] for part in parts]
+        height = max((len(column) for column in columns), default=0)
+        return [[column[i] if i < len(column) else "" for column in columns]
+                for i in range(height)]
+
+    header_rows = stitch(parts[:len(header)])[:1]
+    values = stitch(parts[len(header):])
+    next_offset = None
+    if limit and len(values) > limit:
+        values = values[:limit]
+        next_offset = offset + limit
+
+    payload = {
+        "columns": letters,
         "offset": offset,
         "row_count": len(values),
         "values": header_rows + values,

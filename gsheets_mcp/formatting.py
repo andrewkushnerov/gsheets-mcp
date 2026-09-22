@@ -196,6 +196,16 @@ def window_a1(ref: str | None, offset: int = 0, limit: int | None = None) -> str
     return f"{left}{first + 1}:{right}" + ("" if last is None else str(last + 1))
 
 
+def column_window_a1(letter: str, offset: int = 0, limit: int | None = None) -> str:
+    """One column narrowed to ``limit`` rows starting ``offset`` rows down: ``'G5:G14'``.
+
+    A column can spell an open end — ``'G5:G'`` is valid A1 where ``'5:'`` is not —
+    so unlike :func:`window_a1` this never needs the read-it-all fallback.
+    """
+    first = offset + 1
+    return f"{letter}{first}:{letter}" + ("" if limit is None else str(first + limit - 1))
+
+
 #: Characters that cannot survive into a TSV field: a tab would invent a column
 #: and a newline would invent a row. The backslash is escaped too, so the mapping
 #: stays reversible instead of turning a literal ``\t`` in a cell into a tab.

@@ -6,6 +6,7 @@ from gsheets_mcp.formatting import (
     a1_to_grid_range,
     column_index,
     column_letters,
+    column_window_a1,
     cell_type,
     escape_cell,
     guess_type,
@@ -148,6 +149,13 @@ def test_column_letters_is_the_inverse_of_column_index():
 def test_window_of_the_whole_sheet_is_whole_rows():
     assert window_a1(None, 0, 5000) == "1:5000"
     assert window_a1(None, 100, 50) == "101:150"
+
+
+def test_column_window_is_one_column_of_the_page():
+    assert column_window_a1("G", 0, 5000) == "G1:G5000"
+    assert column_window_a1("G", 100, 50) == "G101:G150"
+    # A column can spell an open end, which whole rows cannot.
+    assert column_window_a1("AB", 4, None) == "AB5:AB"
 
 
 def test_window_inside_a_bounded_range_stays_inside_it():
