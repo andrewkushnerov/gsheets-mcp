@@ -1,6 +1,6 @@
 # gsheets-mcp
 
-**A small, self-hosted MCP server that gives Claude read/write access to your Google Sheets.**
+**A small, self-hosted MCP server that gives Claude read/write access to your Google Sheets, optimised for analytics on tabs of 50k+ rows.**
 
 [![CI](https://github.com/andrewkushnerov/gsheets-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/andrewkushnerov/gsheets-mcp/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
@@ -11,6 +11,22 @@
 ![Claude creating and formatting a Google Sheet through gsheets-mcp](docs/demo.png)
 
 One turn: new spreadsheet, fourteen rows, header bold on green, weekends blue — and where the sea-temperature model stopped at Aug 17, the rest of the column was left blank instead of invented.
+
+> Where did the money go in this Amazon settlement report? Break it down by amount type. https://docs.google.com/spreadsheets/d/1NkN_3IV_KIlHmruuNs-8BdKvStCs-LqTRJ-6FemapTI/edit
+
+| amount-type | sum(amount) | # line items | % of gross sales |
+|---|---:|---:|---:|
+| **ItemPrice** (money in) | **+$246,220.28** | 19,217 | 100% (baseline) |
+| ItemFees | –$87,170.27 | 20,648 | –35.4% |
+| other-transaction | –$25,983.54 | 2 | –10.6% |
+| Promotion | –$12,063.66 | 4,201 | –4.9% |
+| ItemWithheldTax | –$9,081.97 | 5,935 | –3.7% |
+| Cost of Advertising | –$1,211.11 | 3 | –0.5% |
+| FBA Inventory Fee | –$112.78 | 1 | –0.05% |
+| ServiceFee | –$39.99 | 1 | –0.02% |
+| **Net payout (total-amount)** | **$110,556.96** | — | **44.9%** |
+
+That's the table from Sonnet 5's answer. It took five small calls over all 50,009 rows: a look at the tab, this breakdown, two drill-downs, and a check that the lines add up to the report's total — they do, to the cent. The whole exchange used about 42,000 tokens, thinking included, where loading the tab itself would take close to six million. The sheet is public, so the same question works for you. [How it works](#analysing-a-big-tab).
 
 - **Everything is local.** A process on your machine, started by Claude Desktop over stdio.
 - **Nothing is sent anywhere else.** Your laptop talks to Google and back. No SaaS in the middle, no third party holding a token for your Drive.
@@ -24,10 +40,10 @@ Very simple, just roughly 1,500 lines of Python — the cleaned-up version of an
 ## Contents
 
 - [Why](#why)
-- [Quick start](#quick-start)
-- [Connecting Claude](#connecting-claude)
+- [Setup](#setup)
 - [Tools](#tools)
 - [Configuration](#configuration)
+- [Running on a server](#running-on-a-server)
 - [Security](#security)
 - [How it works](#how-it-works)
 - [Development](#development)
@@ -48,114 +64,59 @@ MCP ([Model Context Protocol](https://modelcontextprotocol.io/)) is the standard
 - **Guard rails that actually do something.** Read-only mode removes the write tools entirely, an allowlist pins the server to specific spreadsheets, and a row cap keeps one fat tab from eating the context window.
 - **Errors written for a model.** A `404` comes back as "check the id and make sure the spreadsheet is shared with…", so Claude corrects itself instead of guessing.
 
-## Quick start
+## Setup
+
+You need Python 3.11+, a Google account, and Claude Desktop or Claude Code.
+
+**1. Google Cloud (free, about 5 minutes)**
+
+1. Create a project at [console.cloud.google.com](https://console.cloud.google.com).
+2. Enable the [Google Sheets API](https://console.cloud.google.com/apis/library/sheets.googleapis.com).
+3. [Google Auth Platform](https://console.cloud.google.com/auth/overview) → Get started: any app name, your email, Audience **External**. Then Audience → Test users → add your Google address.
+4. Clients → Create client → **Desktop app**. Download the JSON.
+
+A new app starts in Testing mode. That's fine for personal use, but its token expires after 7 days, so expect to re-run the authorize script below once a week. Audience → **Publish app** ends that: run the script once more and click past the "unverified app" warning. On Google Workspace, pick **Internal** instead of External and skip the test user.
+
+**2. Install**
 
 ```bash
 git clone https://github.com/andrewkushnerov/gsheets-mcp.git
 cd gsheets-mcp
-
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+mv ~/Downloads/client_secret_*.json credentials.json   # the JSON from step 1
+python scripts/google_authorize.py                      # approve in the browser; writes token.json
 ```
 
-Nothing gets installed into your system Python and there's no build step. The code runs straight out of the clone.
+**3. Connect Claude**
 
-Now it needs a Google identity. Option A is what you want on your own machine; option B is for a server.
-
-### Option A — OAuth, acting as you
-
-Five minutes in the Google Cloud Console, once. Stay in the same project the whole way.
-
-1. **Enable the API.** [Console](https://console.cloud.google.com/) → pick a project → search **Google Sheets API** → **Enable**.
-2. **Fill in the consent screen.** [Google Auth Platform](https://console.cloud.google.com/auth/overview) → **Get started**. Four short screens: *App name* (anything, it's only shown to you), *User support email*, *Audience* → **External**, contact email, tick the policy box → **Create**.
-3. **Create the client.** **Create OAuth client** → *Application type* → **Desktop app** → **Create** → download the JSON. Google names it `client_secret_<long-id>.apps.googleusercontent.com.json`; rename it to `credentials.json` and put it in the repo root.
-
-   ```bash
-   mv ~/Downloads/client_secret_*.apps.googleusercontent.com.json credentials.json
-   ```
-4. **Add yourself as a test user.** [Audience](https://console.cloud.google.com/auth/audience) → **Test users** → **Add users** → your own Google address. Skip this and the next step dies with `access_denied`.
-5. **Get the token.**
-
-   ```bash
-   python scripts/google_authorize.py
-   ```
-
-A browser opens, you approve, and `token.json` gets written. The server refreshes it from then on, so that's the last time you see a browser.
-
-<details>
-<summary>Two things Google does to you afterwards</summary>
-
-**The token expires after seven days.** That's what *Testing* means, and the server will start saying the stored token can't be refreshed. [Audience](https://console.cloud.google.com/auth/audience) → **Publish app** moves it to Production and the expiry stops. The consent screen then shows an "unverified app" warning, which you click past once under *Advanced*. Nothing is submitted to Google for review.
-
-**If you have Google Workspace, there's a shorter path.** Pick **Internal** instead of External in step 2: no test-user list, no seven-day expiry, no warning screen. It only works for accounts in your own domain, so the Google account holding the spreadsheets has to be one of them.
-</details>
-
-The server now acts as your Google account, which means it can open every spreadsheet you own. Convenient, and a good reason to turn on the [allowlist](#configuration) once you're past the first experiment.
-
-### Option B — service account (for a server)
-
-1. Google Cloud Console → **enable the Google Sheets API**.
-2. **IAM & Admin → Service Accounts → Create**, then **Keys → Add key → JSON**. Save it as `service_account.json` in the repo root.
-3. In `.env`, set `GOOGLE_SERVICE_ACCOUNT_FILE=./service_account.json`.
-4. Open the service account JSON, copy `client_email`, and share your spreadsheet with that address as Editor, exactly like sharing with a colleague.
-
-Takes ten minutes longer, but there's no browser and no token to refresh, and the server sees only what you shared with it. Worth it for anything that runs unattended.
-
-## Connecting Claude
-
-### Claude Desktop (stdio)
-
-No port and no token: Claude starts the process itself. Edit `claude_desktop_config.json`
-(macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`):
+Claude Desktop: Settings → Developer → Edit Config opens `claude_desktop_config.json`. Add this, with your clone's path (`pwd` prints it) in place of `/path/to/gsheets-mcp`:
 
 ```json
 {
   "mcpServers": {
     "gsheets": {
-      "command": "/absolute/path/to/gsheets-mcp/.venv/bin/python",
+      "command": "/path/to/gsheets-mcp/.venv/bin/python",
       "args": ["-m", "gsheets_mcp", "stdio"],
       "env": {
-        "PYTHONPATH": "/absolute/path/to/gsheets-mcp",
-        "GOOGLE_TOKEN_FILE": "/absolute/path/to/gsheets-mcp/token.json"
+        "PYTHONPATH": "/path/to/gsheets-mcp",
+        "GOOGLE_TOKEN_FILE": "/path/to/gsheets-mcp/token.json"
       }
     }
   }
 }
 ```
 
-All three paths must be absolute. `PYTHONPATH` is what lets Python find the
-`gsheets_mcp` package: Claude Desktop starts the process from its own working
-directory, not from the clone, and nothing was installed for it to fall back on.
-For the same reason `.env` isn't read here, so pass what you need via `env`
-(on a service account that's `GOOGLE_SERVICE_ACCOUNT_FILE` instead of the token).
-
-Restart Claude Desktop and the tools show up under the connectors icon.
-
-### Claude Code (HTTP)
-
-Start the server:
+Claude Code: one command from the clone, where `$PWD` fills in the same paths:
 
 ```bash
-python -m gsheets_mcp            # http://127.0.0.1:8077/mcp
-curl -s localhost:8077/ | python -m json.tool
+claude mcp add gsheets -s user -e PYTHONPATH="$PWD" -e GOOGLE_TOKEN_FILE="$PWD/token.json" \
+  -- "$PWD/.venv/bin/python" -m gsheets_mcp stdio
 ```
 
-Then point Claude Code at it:
+Restart Claude and try it on the public demo sheet: *"What's in this spreadsheet? https://docs.google.com/spreadsheets/d/1NkN_3IV_KIlHmruuNs-8BdKvStCs-LqTRJ-6FemapTI/edit"*
 
-```bash
-# Give the server a token first (worth doing even locally):
-python -c "import secrets; print(secrets.token_urlsafe(32))"   # → put it in .env as MCP_AUTH_TOKEN
-
-claude mcp add --transport http gsheets http://127.0.0.1:8077/mcp \
-  --header "Authorization: Bearer <your-token>"
-```
-
-Then just ask: *"list the tabs of spreadsheet 1AbC…"*
-
-### Remote / team use
-
-Put the HTTP server behind HTTPS (Caddy, nginx, Traefik), set `MCP_AUTH_TOKEN`, and point Claude Code at the public URL. One caveat: the **claude.ai custom-connector UI** expects an OAuth 2.1 handshake (RFC 9728 discovery plus RFC 7591 dynamic client registration) rather than a static header, and that's a layer this repo leaves out on purpose. Open an issue if you want it upstream.
+For a server that runs unattended, see [Running on a server](#running-on-a-server).
 
 ## Tools
 
@@ -220,35 +181,9 @@ Two arguments: `sample_rows` and `preview: false`.
 
 `preview: false` gives the bare tab list for one API call instead of three. Preview costs three because one call fetches properties, one the top of every tab, and one the depth probe — batched across the whole document, so the count does not grow with the number of tabs.
 
-### Reading a big tab
+### Analysing a big tab
 
-A read never downloads the whole sheet. `GSHEETS_MAX_READ_ROWS` is the page size, it is pushed into the A1 range so Google sends the page rather than the tab, and the response says where to continue:
-
-```
-range: 'Orders'!A1:H5000
-rows: 5000; more follow — call again with offset=5000
-```
-
-Call again with that `offset` for the next page. From page two on, the range's first row is repeated above the page — in the same request, so a page still costs one round trip — which keeps the columns named:
-
-```
-rows: 5000 from offset 5000 (+ the header row repeated above them); more follow — call again with offset=10000
-```
-
-Pass `include_header: false` to turn that off, or `limit` to ask for a smaller page. `limit` cannot exceed the server's cap; that is the point of the cap.
-
-**On a wide tab, ask for columns.** `columns: ["G", "H", "O"]` reads only those columns — the letters `gsheets_list_sheets` printed; a span like `"A:D"` works too — and stitches them into rows, so a row of the 24-column settlement fixture costs a dozen tokens instead of about ninety. It is one round trip whatever the number of columns. Rows are still paged with `offset` and `limit`, and page two still carries the header:
-
-```
-columns: G, H, O
-rows: 5000; more follow — call again with offset=5000
-```
-
-One thing to know: the API trims a column's trailing blanks, so the page is as tall as the tallest column asked for. Ask for a sparse column on its own and the tab reads shorter than it is.
-
-### Summarising a big tab
-
-"How many orders" or "revenue per SKU" does not need the rows, it needs one number per group. `gsheets_aggregate` computes it on the server from the columns the question names, every row of them, and returns only the groups. On the 50k-row settlement fixture:
+"How many orders" or "revenue per SKU" doesn't need the rows, it needs one number per group. `gsheets_aggregate` computes it on the server and returns only the groups. On the 50k-row settlement fixture:
 
 ```json
 {"spreadsheet_id": "…", "sheet_name": "amazon_settlement_test_50k",
@@ -270,11 +205,11 @@ BW-KT-0118-SET	6746.32	153
 BW-GD-0210-SET	5885.79	123
 ```
 
-Three columns of 50k rows travel from Google to the server, about a megabyte, and a few hundred tokens travel from the server to the model. Reading the tab instead would be ten pages of half a million tokens each.
+Only the four columns the query names leave Google, not all 24, and 174 tokens reach the model. Reading the tab instead would be ten full pages of nearly 600,000 tokens each.
 
-Columns are named by header text or letter. `count` on its own counts rows; with a column it counts non-empty cells, and `count_distinct`, `sum`, `min`, `max` and `avg` all skip empty cells, so a totals line with a blank order id does not become an order. `sum` and `avg` also skip cells that are not numbers and say so on a `skipped:` line, and `avg` is rounded to four decimals. Blank cells in a `group_by` column form a group of their own, shown as a blank key; `{"column": "sku", "op": "ne", "value": ""}` leaves them out. Numbers are read the way the sheet displays them, so `$1,240.50`, `12%` and `(340)` all count — it is the same parsing `gsheets_list_sheets` types columns with. `where` takes `eq`, `ne`, `in`, `gt`, `gte`, `lt`, `lte`, `contains` and `is_empty`; comparisons are numeric when both sides are numbers and textual otherwise, and `contains` ignores case. Groups come back sorted by the first metric, 200 of them unless `limit` says otherwise.
+It counts the way a person would: empty cells are skipped, so a totals line with a blank order id isn't an order, and numbers are read as the sheet shows them — `$1,240.50`, `12%`, `(340)`. There's no `having`, no second level of grouping and no `or` on purpose: anything past a group-by with a filter is "get the groups and finish the arithmetic in context", and that boundary keeps the schema small enough for a model to fill in correctly.
 
-It reads the whole column whatever `GSHEETS_MAX_READ_ROWS` says: the cap protects the model's context, and none of these rows reach it. There is no `having`, no second level of grouping and no `or` between conditions on purpose — anything past a group-by with a filter is "get the groups and finish the arithmetic in context", and that boundary is what keeps the schema small enough for a model to fill in correctly.
+When you do need the rows, `gsheets_read_sheet` returns them a page at a time, `GSHEETS_MAX_READ_ROWS` (5,000 by default) per call, and says which `offset` to continue from. On a wide tab, `columns: ["G", "H", "O"]` reads only those columns, so a row of the 24-column fixture costs a dozen tokens instead of about ninety. The page cap protects the model's context, which is why `gsheets_aggregate` reads every row regardless: none of them reach the model.
 
 ### Colouring cells
 
@@ -319,7 +254,7 @@ With the flag off the tool is not registered at all: it never appears in `tools/
 
 ## Configuration
 
-All settings are environment variables, read from `.env` if it's there. Every one has a working default, see [.env.example](.env.example).
+All settings are environment variables, and every one has a working default, see [.env.example](.env.example). A server you start yourself also reads `.env` from the directory it starts in. Claude Desktop and Claude Code start it from somewhere else, so for them a setting goes in the config's `env` block, or `-e KEY=value` on `claude mcp add`.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -335,6 +270,38 @@ All settings are environment variables, read from `.env` if it's there. Every on
 | `GSHEETS_OUTPUT_FORMAT` | `tsv` | Sheet contents and the tab list as tab-separated text, or `json` for structured output. TSV costs roughly half the tokens. |
 | `GSHEETS_ENABLE_DRIVE_SEARCH` | `false` | `true` registers `gsheets_find_spreadsheets` and asks for the Drive scope. |
 | `LOG_LEVEL` | `INFO` | Standard Python levels. |
+
+## Running on a server
+
+For a machine nobody sits at, trade the OAuth token for a service account, and stdio for HTTP.
+
+**1. Service account (about 10 minutes)**
+
+1. In a project with the Sheets API enabled (steps 1–2 of [Setup](#setup)): IAM & Admin → Service Accounts → Create.
+2. Keys → Add key → JSON. The file it downloads goes into the clone as `service_account.json`.
+3. Share each spreadsheet with the account's `client_email` (it's in that file) as Editor, like sharing with a colleague.
+
+No browser, no token to refresh, and the server sees only what you shared with it.
+
+**2. Run**
+
+```bash
+git clone https://github.com/andrewkushnerov/gsheets-mcp.git
+cd gsheets-mcp
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env    # then uncomment GOOGLE_SERVICE_ACCOUNT_FILE and set MCP_AUTH_TOKEN
+python -m gsheets_mcp   # http://127.0.0.1:8077/mcp
+```
+
+Any long random string works as `MCP_AUTH_TOKEN`; `python -c "import secrets; print(secrets.token_urlsafe(32))"` prints one. The server listens on 127.0.0.1, so put HTTPS in front of it (Caddy, nginx, Traefik).
+
+**3. Connect Claude Code**
+
+```bash
+claude mcp add gsheets -s user --transport http https://your-host/mcp \
+  --header "Authorization: Bearer <MCP_AUTH_TOKEN>"
+```
 
 ## Security
 
@@ -397,7 +364,7 @@ The description and JSON Schema *are* the prompt the model sees. Vague descripti
 The tests came with the install above, so there's nothing else to set up:
 
 ```bash
-python -m pytest tests -q     # 117 tests, no network, no credentials needed
+python -m pytest tests -q     # no network, no credentials needed
 ```
 
 Run them with `python -m` rather than bare `pytest`: nothing is installed, so the
@@ -411,7 +378,7 @@ Two big, realistic sheets to try the server against:
 python scripts/generate_amazon_settlement.py    # → tests/fixtures/amazon_settlement_test_{5k,50k}.txt
 ```
 
-They have the shape of Amazon's settlement report — 24 columns, a line per money movement, several per order — over a made-up catalogue and made-up ids, tab-separated like the real download. The 5k one is a whisker over the default `GSHEETS_MAX_READ_ROWS` page, so a whole-tab read has to page exactly once, and it still costs about half a million tokens read raw; the 50k one is ten pages and close to five million. Import one into a spreadsheet (File → Import) and point the server at it. `--rows N --out file` writes one of any size (`.csv` gets commas), `--seed` reshuffles it.
+They have the shape of Amazon's settlement report — 24 columns, a line per money movement, several per order — over a made-up catalogue and made-up ids, tab-separated like the real download. The 5k one is a whisker over the default `GSHEETS_MAX_READ_ROWS` page, so a whole-tab read has to page exactly once, and it still costs nearly 600,000 tokens read raw; the 50k one is ten pages and close to six million. Import one into a spreadsheet (File → Import) and point the server at it. `--rows N --out file` writes one of any size (`.csv` gets commas), `--seed` reshuffles it.
 
 Poke at a running server by hand:
 

@@ -6,8 +6,7 @@ scales by adding processes.
 
 Auth is a bearer token compared in constant time. That is enough for Claude Code
 (`--header "Authorization: Bearer ..."`) and for a private deployment. The Claude
-desktop/web connector UI wants a full OAuth 2.1 handshake instead — see the README
-for what that adds.
+desktop/web connector UI wants a full OAuth 2.1 handshake instead.
 """
 from __future__ import annotations
 

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.3 — 2026-09-23
+
+A second example in the README, on a 50k-row report anyone can try, and a setup that
+fits on one screen.
+
+### Added
+
+- A second example at the top of the README: one question about a 50,009-row Amazon
+  settlement report, answered by Sonnet 5 in five small tool calls and about 42,000
+  tokens all told, where loading the tab itself would take close to six million. The
+  report is the synthetic fixture from `tests/fixtures/`, published as a
+  [public Google Sheet](https://docs.google.com/spreadsheets/d/1NkN_3IV_KIlHmruuNs-8BdKvStCs-LqTRJ-6FemapTI/edit),
+  so the same question works for anyone. The last step of Setup points at it too, and
+  the first question after installing needs no data of your own.
+
+### Changed
+
+- Setup is three short steps — Google Cloud, install, connect — and the service
+  account and the HTTP transport moved to their own section, "Running on a server".
+  Claude Code connects over stdio with a single `claude mcp add`, registered for every
+  project with `-s user`; the old command had no scope, so the server showed up only
+  in sessions started from the directory it was added in.
+- "Reading a big tab" and "Summarising a big tab" are one section, "Analysing a big
+  tab": summarise first, read the rows when you need them.
+- Token figures in the README are measured with Claude's tokenizer instead of
+  estimated: a 5,000-row page of the settlement report is nearly 600,000 tokens rather
+  than half a million, and the whole 50k-row tab close to six million rather than five.
+
+
 ## 0.4.2 — 2026-09-23
 
 The answer without the rows: a tab too big to read can still be summed up.
