@@ -5,4 +5,4 @@
 #: rather than a second place to type the number. It lives in this module because
 #: this module has no imports: CI reads it from a bare checkout without installing
 #: a single dependency, which ``protocol.py`` (pydantic, googleapiclient) could not do.
-__version__ = "0.4.1"
+__version__ = "0.4.2"

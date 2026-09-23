@@ -88,7 +88,7 @@ def test_401_advertises_the_bearer_scheme(env):
 def test_read_only_instance_advertises_only_read_tools(env):
     c = client(env, gsheets_read_only="true")
     names = {t["name"] for t in rpc(c, "tools/list").json()["result"]["tools"]}
-    assert names == {"gsheets_list_sheets", "gsheets_read_sheet"}
+    assert names == {"gsheets_list_sheets", "gsheets_read_sheet", "gsheets_aggregate"}
     assert c.get("/").json()["read_only"] is True
 
 

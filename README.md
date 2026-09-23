@@ -162,7 +162,8 @@ Put the HTTP server behind HTTPS (Caddy, nginx, Traefik), set `MCP_AUTH_TOKEN`, 
 | Tool | Writes | What it does |
 |---|:---:|---|
 | `gsheets_list_sheets` | no | Tabs of a spreadsheet, each one profiled: columns, types, sample rows, real row count. Start here. |
-| `gsheets_read_sheet` | no | One tab as a tab-separated grid (or JSON, see `GSHEETS_OUTPUT_FORMAT`). Optional A1 `range`, paged with `offset`/`limit`. |
+| `gsheets_read_sheet` | no | One tab as a tab-separated grid (or JSON, see `GSHEETS_OUTPUT_FORMAT`). Optional A1 `range` or `columns`, paged with `offset`/`limit`. |
+| `gsheets_aggregate` | no | Count, sum, min, max, avg per group over the rows that pass a filter. The answer without the rows. |
 | `gsheets_append_rows` | yes | Adds rows below the last non-empty one. Nothing is overwritten. |
 | `gsheets_update_sheet` | destructive | With `range`, a partial update anchored at that cell. Without one, replaces the whole tab. |
 | `gsheets_format_cells` | yes | Background fill, text colour, bold, italic. Values are untouched. |
@@ -244,6 +245,36 @@ rows: 5000; more follow — call again with offset=5000
 ```
 
 One thing to know: the API trims a column's trailing blanks, so the page is as tall as the tallest column asked for. Ask for a sparse column on its own and the tab reads shorter than it is.
+
+### Summarising a big tab
+
+"How many orders" or "revenue per SKU" does not need the rows, it needs one number per group. `gsheets_aggregate` computes it on the server from the columns the question names, every row of them, and returns only the groups. On the 50k-row settlement fixture:
+
+```json
+{"spreadsheet_id": "…", "sheet_name": "amazon_settlement_test_50k",
+ "group_by": ["sku"],
+ "metrics": [{"column": "amount", "fn": "sum"}, {"column": "order-id", "fn": "count_distinct"}],
+ "where": [{"column": "transaction-type", "op": "eq", "value": "Order"}],
+ "limit": 5}
+```
+
+```
+scanned: 50009 rows, 48887 matched
+groups: 38, shown: 5, sorted by sum(amount) desc — raise `limit` or narrow `where` for the rest
+
+sku	sum(amount)	count_distinct(order-id)
+BW-KT-0112-L	16480.43	704
+BW-GD-0201-GRN	9540.83	504
+BW-KT-0112-XL	8404.05	286
+BW-KT-0118-SET	6746.32	153
+BW-GD-0210-SET	5885.79	123
+```
+
+Three columns of 50k rows travel from Google to the server, about a megabyte, and a few hundred tokens travel from the server to the model. Reading the tab instead would be ten pages of half a million tokens each.
+
+Columns are named by header text or letter. `count` on its own counts rows; with a column it counts non-empty cells, and `count_distinct`, `sum`, `min`, `max` and `avg` all skip empty cells, so a totals line with a blank order id does not become an order. `sum` and `avg` also skip cells that are not numbers and say so on a `skipped:` line, and `avg` is rounded to four decimals. Blank cells in a `group_by` column form a group of their own, shown as a blank key; `{"column": "sku", "op": "ne", "value": ""}` leaves them out. Numbers are read the way the sheet displays them, so `$1,240.50`, `12%` and `(340)` all count — it is the same parsing `gsheets_list_sheets` types columns with. `where` takes `eq`, `ne`, `in`, `gt`, `gte`, `lt`, `lte`, `contains` and `is_empty`; comparisons are numeric when both sides are numbers and textual otherwise, and `contains` ignores case. Groups come back sorted by the first metric, 200 of them unless `limit` says otherwise.
+
+It reads the whole column whatever `GSHEETS_MAX_READ_ROWS` says: the cap protects the model's context, and none of these rows reach it. There is no `having`, no second level of grouping and no `or` between conditions on purpose — anything past a group-by with a filter is "get the groups and finish the arithmetic in context", and that boundary is what keeps the schema small enough for a model to fill in correctly.
 
 ### Colouring cells
 

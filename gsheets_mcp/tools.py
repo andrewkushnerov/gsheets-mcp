@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 
+from .aggregate import FUNCTIONS, OPERATORS, Condition, Key, Metric, aggregate
 from .config import get_settings
 from .formatting import (
     EMPTY_WINDOW,
@@ -809,6 +810,223 @@ def _read_columns(spreadsheet_id: str, sheet: str, letters: list[str], offset: i
     if next_offset is not None:
         payload["next_offset"] = next_offset
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Aggregation — the answer without the rows
+# ---------------------------------------------------------------------------
+
+def _column_by_ref(ref, header: list[str]) -> int:
+    """A header name or a column letter -> 0-based column index.
+
+    The header wins: a tab whose first row says ``A`` in some column means that
+    column, not the first. Case is forgiven when that leaves exactly one match.
+    """
+    text = str(ref).strip()
+    if not text:
+        raise ValueError("a column reference is empty")
+    names = [str(cell).strip() for cell in header]
+    if text in names:
+        return names.index(text)
+    lowered = [name.lower() for name in names]
+    if lowered.count(text.lower()) == 1:
+        return lowered.index(text.lower())
+    if _COLUMN_LETTERS.match(text.upper()):
+        return column_index(text)
+    known = ", ".join(name for name in names if name)
+    raise ValueError(f"no column called '{text}'. The header row has: {known[:600]}")
+
+
+def _column_name(header: list[str], index: int) -> str:
+    name = str(header[index]).strip() if index < len(header) else ""
+    return name or column_letters(index)
+
+
+def _references(args: dict, key: str) -> list:
+    """A list argument that a model sometimes sends as one bare value."""
+    raw = args.get(key)
+    if raw is None or raw == "":
+        return []
+    return raw if isinstance(raw, list) else [raw]
+
+
+def _metric_specs(args: dict, header: list[str]) -> list[tuple[str, int | None, str]]:
+    """``metrics`` -> (fn, sheet column or None, label); a bare count when omitted."""
+    raw = _references(args, "metrics") or [{"fn": "count"}]
+    specs = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "each metric is an object like {\"column\": \"amount\", \"fn\": \"sum\"}"
+            )
+        fn = str(item.get("fn") or "").strip().lower()
+        if fn not in FUNCTIONS:
+            raise ValueError(f"unknown metric fn '{fn}'. Use one of: {', '.join(FUNCTIONS)}")
+        ref = item.get("column")
+        if ref is None or str(ref).strip() == "":
+            if fn != "count":
+                raise ValueError(f"'{fn}' needs a column")
+            specs.append((fn, None, "count"))
+            continue
+        index = _column_by_ref(ref, header)
+        specs.append((fn, index, f"{fn}({_column_name(header, index)})"))
+    return specs
+
+
+def _condition_specs(args: dict, header: list[str]) -> list[tuple[int, str, object]]:
+    """``where`` -> (sheet column, op, value) triples, each checked for shape."""
+    specs = []
+    for item in _references(args, "where"):
+        if not isinstance(item, dict) or "column" not in item:
+            raise ValueError(
+                "each condition is an object like "
+                "{\"column\": \"transaction-type\", \"op\": \"eq\", \"value\": \"Order\"}"
+            )
+        op = str(item.get("op") or "").strip().lower()
+        if op not in OPERATORS:
+            raise ValueError(f"unknown where op '{op}'. Use one of: {', '.join(OPERATORS)}")
+        value = item.get("value")
+        if op == "in" and not isinstance(value, list):
+            raise ValueError("'in' takes a list of values")
+        if op not in ("in", "is_empty") and (value is None or isinstance(value, (list, dict))):
+            raise ValueError(f"'{op}' needs a single value")
+        specs.append((_column_by_ref(item["column"], header), op, value))
+    return specs
+
+
+def _render_aggregate(payload: dict) -> dict | str:
+    if get_settings().gsheets_output_format == "json":
+        return payload
+    scanned = f"scanned: {payload['scanned']} rows"
+    if payload["filtered"]:
+        scanned += f", {payload['matched']} matched"
+    groups = (f"groups: {payload['groups']}, shown: {payload['shown']}, "
+              f"sorted by {payload['sorted_by']} desc")
+    if payload["groups"] > payload["shown"]:
+        groups += " — raise `limit` or narrow `where` for the rest"
+    head = [scanned, groups]
+    for label, count in payload.get("skipped", {}).items():
+        head.append(f"skipped: {count} cells in {label} were not numbers")
+    return "\n".join(head) + "\n\n" + rows_to_tsv(payload["values"])
+
+
+@mcp_tool(
+    "gsheets_aggregate",
+    "Summarise a tab without reading it: count, count_distinct, sum, min, max or avg per "
+    "group, over the rows that pass `where`. Only the columns named leave Google, every "
+    "row of them, and only the groups come back — 'how many orders' or 'revenue per SKU' "
+    "on a 50k-row tab is one call and a few hundred tokens. Row 1 is the header; name "
+    "columns by header text or letter. Returns a `scanned:` line, a `groups:` line, then "
+    "the groups as a tab-separated table sorted by the first metric, descending.",
+    {
+        "type": "object",
+        "properties": {
+            "spreadsheet_id": _SPREADSHEET_ID_PROP,
+            "sheet_name": _SHEET_NAME_PROP,
+            "group_by": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Columns to group by, by header name or letter. Omit for a "
+                               "single line of totals. Blank cells form a group of their "
+                               "own, shown as a blank key; a `where` of op `ne`, value \"\" "
+                               "on that column leaves them out.",
+            },
+            "metrics": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "column": {"type": "string"},
+                        "fn": {"type": "string", "enum": list(FUNCTIONS)},
+                    },
+                    "required": ["fn"],
+                },
+                "description": "What to compute per group, e.g. [{\"column\": \"amount\", "
+                               "\"fn\": \"sum\"}]. `count` with no column counts rows; with "
+                               "one it counts non-empty cells, and `count_distinct` counts "
+                               "distinct non-empty values — a blank is never a value. "
+                               "sum/avg skip cells that are not numbers and say so; avg is "
+                               "rounded to 4 decimals. Numbers are read as the sheet shows "
+                               "them ($1,240.50 is fine). Default: a bare count.",
+            },
+            "where": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "column": {"type": "string"},
+                        "op": {"type": "string", "enum": list(OPERATORS)},
+                        "value": {},
+                    },
+                    "required": ["column", "op"],
+                },
+                "description": "Row filters that must all hold, e.g. [{\"column\": "
+                               "\"transaction-type\", \"op\": \"eq\", \"value\": \"Order\"}]. "
+                               "Comparisons are numeric when both sides are numbers, textual "
+                               "otherwise; `contains` ignores case; `in` takes a list; "
+                               "`is_empty` needs no value.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Groups to return, default 200. The `groups:` line says "
+                               "how many there were.",
+            },
+        },
+        "required": ["spreadsheet_id", "sheet_name"],
+    },
+)
+def gsheets_aggregate(args: dict) -> dict | str:
+    spreadsheet_id = _spreadsheet_id(args)
+    sheet = _quote_sheet(_require(args, "sheet_name"))
+    limit = _whole_number(args, "limit", 200) or 200
+    cap = get_settings().gsheets_max_read_rows
+    if cap:
+        limit = min(limit, cap)
+
+    # The header first: it is what names resolve against, and what the answer's
+    # own header is written from.
+    top = _execute(
+        get_sheets_service().spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{sheet}!1:1", majorDimension="ROWS"
+        ),
+        spreadsheet_id,
+    )
+    header = [str(cell) for cell in (top.get("values") or [[]])[0]]
+
+    key_columns = [_column_by_ref(ref, header) for ref in _references(args, "group_by")]
+    metric_specs = _metric_specs(args, header)
+    condition_specs = _condition_specs(args, header)
+
+    # Only the columns the question names leave Google: "orders per SKU" on a
+    # 24-column tab moves two columns, not twenty-four. Each is fetched whole,
+    # whatever the page cap says — the cap protects the model's context, and none
+    # of these rows reach it.
+    needed: list[int] = []
+    for index in (key_columns + [column for _, column, _ in metric_specs if column is not None]
+                  + [column for column, _, _ in condition_specs]):
+        if index not in needed:
+            needed.append(index)
+    if not needed:
+        raise ValueError(
+            "nothing to read: give `group_by`, `where` or a column to count. For the "
+            "tab's row count, gsheets_list_sheets already has it."
+        )
+    position = {index: i for i, index in enumerate(needed)}
+    letters = [column_letters(index) for index in needed]
+    rows = _read_columns(spreadsheet_id, sheet, letters, 0, 0, False)["values"][1:]
+
+    keys = [Key(position[index], _column_name(header, index)) for index in key_columns]
+    metrics = [
+        Metric(fn, None if column is None else position[column], label)
+        for fn, column, label in metric_specs
+    ]
+    conditions = [Condition(position[column], op, value) for column, op, value in condition_specs]
+
+    payload = aggregate(rows, keys, metrics, conditions, limit)
+    payload["filtered"] = bool(conditions)
+    payload["sorted_by"] = metrics[0].label
+    return _render_aggregate(payload)
 
 
 # ---------------------------------------------------------------------------

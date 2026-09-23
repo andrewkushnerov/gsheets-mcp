@@ -263,14 +263,14 @@ _SEPARATORS = re.compile(r"[,\u00a0 ]")
 _CURRENCY = "$€£¥₽₴₸"
 
 
-def _is_number(text: str) -> bool:
-    """Does this *formatted* cell read as a number?
+def parse_number(text: str) -> float | None:
+    """The number behind a *formatted* cell, or None when it does not read as one.
 
     The values API is called without ``valueRenderOption``, so every cell arrives
     as the string the sheet displays — ``'$1,240.50'``, ``'12%'`` and ``'(340)'``
     included. Undoing that presentation is the only way to tell a numeric column
-    from a text one, and being wrong either way is cheap: the type is a hint for
-    the model, never something the server acts on.
+    from a text one, and the only way to add such a column up. A percent comes
+    back as its face value: ``'12%'`` is 12, not 0.12.
     """
     cleaned = text.strip().lstrip(_CURRENCY).rstrip("%").strip()
     if cleaned.startswith("(") and cleaned.endswith(")"):
@@ -286,12 +286,17 @@ def _is_number(text: str) -> bool:
         cleaned = cleaned.replace(",", ".")  # decimal comma
     if not any(char.isdigit() for char in cleaned):
         # float() also accepts 'nan' and 'inf', which in a spreadsheet are words.
-        return False
+        return None
     try:
-        float(cleaned)
+        return float(cleaned)
     except ValueError:
-        return False
-    return True
+        return None
+
+
+def _is_number(text: str) -> bool:
+    """Does this *formatted* cell read as a number? Being wrong here is cheap: the
+    type is a hint for the model, never something the server acts on."""
+    return parse_number(text) is not None
 
 
 def cell_type(value) -> str:

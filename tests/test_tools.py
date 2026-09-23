@@ -472,6 +472,114 @@ def test_read_sheet_columns_tsv_names_the_columns(values):
     assert result == "columns: V, O\nrows: 2\n\nsku\tamount\nA-1\t7.99"
 
 
+def _settlement(values):
+    """A four-column tab: the header on row 1, then the columns the tool asks for."""
+    values.get.return_value.execute.return_value = {
+        "values": [["transaction-type", "order-id", "amount", "sku"]]
+    }
+    values.batchGet.return_value.execute.return_value = {"valueRanges": [
+        {"values": [["sku", "A-1", "A-1", "B-2", ""]]},
+        {"values": [["amount", "10.00", "5.50", "7.00", "22.50"]]},
+        {"values": [["transaction-type", "Order", "Order", "Refund"]]},
+    ]}
+
+
+def test_aggregate_reads_only_the_columns_the_question_names(values, env):
+    env(gsheets_output_format="json")
+    _settlement(values)
+    result = tools.gsheets_aggregate({
+        "spreadsheet_id": "SSID", "sheet_name": "Data",
+        "group_by": ["sku"],
+        "metrics": [{"column": "amount", "fn": "sum"}],
+        "where": [{"column": "transaction-type", "op": "eq", "value": "Order"}],
+    })
+    # The header row names the columns; then each named column, whole, in one trip.
+    values.get.assert_called_once_with(
+        spreadsheetId="SSID", range="'Data'!1:1", majorDimension="ROWS"
+    )
+    values.batchGet.assert_called_once_with(
+        spreadsheetId="SSID",
+        ranges=["'Data'!D1:D", "'Data'!C1:C", "'Data'!A1:A"],
+        majorDimension="COLUMNS",
+    )
+    assert result["values"] == [["sku", "sum(amount)"], ["A-1", "15.5"]]
+    assert (result["scanned"], result["matched"], result["groups"]) == (4, 2, 1)
+    assert result["filtered"] is True
+    assert result["sorted_by"] == "sum(amount)"
+
+
+def test_aggregate_renders_as_text_by_default(values):
+    _settlement(values)
+    result = tools.gsheets_aggregate({
+        "spreadsheet_id": "SSID", "sheet_name": "Data",
+        "group_by": "D", "metrics": [{"fn": "count"}], "limit": 1,
+    })
+    assert result == (
+        "scanned: 4 rows\n"
+        "groups: 3, shown: 1, sorted by count desc — raise `limit` or narrow `where` "
+        "for the rest\n\n"
+        "sku\tcount\nA-1\t2"
+    )
+
+
+def test_aggregate_says_when_it_skipped_cells_that_were_not_numbers(values):
+    _settlement(values)
+    values.batchGet.return_value.execute.return_value = {"valueRanges": [
+        {"values": [["amount", "10.00", "n/a", "7.00"]]},
+    ]}
+    result = tools.gsheets_aggregate({
+        "spreadsheet_id": "SSID", "sheet_name": "Data",
+        "metrics": [{"column": "amount", "fn": "avg"}],
+    })
+    assert "skipped: 1 cells in avg(amount) were not numbers" in result
+    assert result.endswith("avg(amount)\n8.5")
+
+
+def test_aggregate_resolves_names_case_insensitively_and_letters_by_position(values, env):
+    env(gsheets_output_format="json")
+    _settlement(values)
+    tools.gsheets_aggregate({
+        "spreadsheet_id": "SSID", "sheet_name": "Data",
+        "group_by": ["SKU"], "metrics": [{"column": "c", "fn": "max"}],
+    })
+    assert values.batchGet.call_args.kwargs["ranges"] == ["'Data'!D1:D", "'Data'!C1:C"]
+
+
+def test_aggregate_names_the_columns_it_knows_when_one_is_missing(values):
+    _settlement(values)
+    with pytest.raises(ValueError, match="no column called 'price'.*transaction-type, order-id"):
+        tools.gsheets_aggregate({
+            "spreadsheet_id": "SSID", "sheet_name": "Data",
+            "metrics": [{"column": "price", "fn": "sum"}],
+        })
+
+
+@pytest.mark.parametrize("bad, message", [
+    ({"metrics": [{"column": "amount", "fn": "median"}]}, "unknown metric fn"),
+    ({"metrics": [{"fn": "sum"}]}, "needs a column"),
+    ({"metrics": ["sum"]}, "each metric is an object"),
+    ({"where": [{"column": "sku", "op": "like", "value": "A"}]}, "unknown where op"),
+    ({"where": [{"column": "sku", "op": "in", "value": "A-1"}]}, "takes a list"),
+    ({"where": [{"column": "sku", "op": "eq", "value": ["A-1"]}]}, "needs a single value"),
+    ({"where": [{"op": "eq", "value": "x"}]}, "each condition is an object"),
+    ({}, "nothing to read"),
+])
+def test_aggregate_rejects_a_malformed_question(values, bad, message):
+    _settlement(values)
+    with pytest.raises(ValueError, match=message):
+        tools.gsheets_aggregate({"spreadsheet_id": "SSID", "sheet_name": "Data", **bad})
+    values.batchGet.assert_not_called()
+
+
+def test_aggregate_limit_is_capped_like_a_read(values, env):
+    env(gsheets_max_read_rows=2, gsheets_output_format="json")
+    _settlement(values)
+    result = tools.gsheets_aggregate({
+        "spreadsheet_id": "SSID", "sheet_name": "Data", "group_by": ["sku"], "limit": 500,
+    })
+    assert (result["groups"], result["shown"]) == (3, 2)
+
+
 def test_update_full_replace_clears_then_appends(values):
     values.append.return_value.execute.return_value = {
         "updates": {"updatedRange": "'Data'!A1:B2", "updatedRows": 2,

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.2 — 2026-09-23
+
+The answer without the rows: a tab too big to read can still be summed up.
+
+### Added
+
+- `gsheets_aggregate` — count, count_distinct, sum, min, max or avg per group, over
+  the rows that pass `where`, with none of those rows reaching the model. Only the
+  columns the question names leave Google, every row of them, and what comes back is
+  one line per group, sorted by the first metric: "how many orders" on the 50k-row
+  fixture is one call and a few dozen tokens where it was ten pages of half a
+  million each. Columns are named by header text or letter. Empty cells never count,
+  so a totals line with a blank order id is not an order; `sum` and `avg` skip cells
+  that are not numbers and say so on a `skipped:` line, and `avg` is rounded to four
+  decimals. Numbers are read the way the sheet displays them — `$1,240.50`, `12%`,
+  `(340)` — with the same parsing that types columns in `gsheets_list_sheets`. Nine
+  `where` operators, numeric when both sides are numbers and textual otherwise. 200
+  groups by default; the `groups:` line says how many there were. It changes
+  nothing, so it is there in read-only mode too.
+- `parse_number` in `formatting`: the number behind a formatted cell, which the type
+  inference used to establish and throw away.
+
 ## 0.4.1 — 2026-09-22
 
 A first step towards tabs too big to read whole: read the columns a question needs
