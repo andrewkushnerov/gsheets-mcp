@@ -14,19 +14,19 @@ One turn: new spreadsheet, fourteen rows, header bold on green, weekends blue �
 
 > Where did the money go in this Amazon settlement report? Break it down by amount type. https://docs.google.com/spreadsheets/d/1NkN_3IV_KIlHmruuNs-8BdKvStCs-LqTRJ-6FemapTI/edit
 
-| amount-type | sum(amount) | # line items | % of gross sales |
-|---|---:|---:|---:|
-| **ItemPrice** (money in) | **+$246,220.28** | 19,217 | 100% (baseline) |
-| ItemFees | –$87,170.27 | 20,648 | –35.4% |
-| other-transaction | –$25,983.54 | 2 | –10.6% |
-| Promotion | –$12,063.66 | 4,201 | –4.9% |
-| ItemWithheldTax | –$9,081.97 | 5,935 | –3.7% |
-| Cost of Advertising | –$1,211.11 | 3 | –0.5% |
-| FBA Inventory Fee | –$112.78 | 1 | –0.05% |
-| ServiceFee | –$39.99 | 1 | –0.02% |
-| **Net payout (total-amount)** | **$110,556.96** | — | **44.9%** |
+| Amount type | Net amount | % of ItemPrice | What's in it |
+|---|---:|---:|---|
+| ItemPrice | $246,220.28 | 100% | Product $227,758.79, shipping $9,379.52, tax $9,081.97 (after refunds) |
+| ItemFees | −$87,170.27 | 35.4% | FBA fulfillment −$51,699.94, commission −$32,406.91, shipping chargeback −$2,899.90, refund commission −$163.52 |
+| other-transaction | −$25,983.54 | 10.6% | Reserve: −$28,028.59 held this period, +$2,045.05 released from last period |
+| Promotion | −$12,063.66 | 4.9% | Shipping promos −$6,479.62, product promos −$5,584.04 |
+| ItemWithheldTax | −$9,081.97 | 3.7% | Marketplace facilitator tax that Amazon pays to the states |
+| Cost of Advertising | −$1,211.11 | 0.5% | 3 ad charges |
+| FBA Inventory Fee | −$112.78 | 0.05% | Storage |
+| ServiceFee | −$39.99 | 0.02% | Subscription |
+| **Deposit** | **$110,556.96** | **44.9%** | |
 
-That's the table from Sonnet 5's answer. It took five small calls over all 50,009 rows: a look at the tab, this breakdown, two drill-downs, and a check that the lines add up to the report's total — they do, to the cent. The whole exchange used about 42,000 tokens, thinking included, where loading the tab itself would take close to six million. The sheet is public, so the same question works for you. [How it works](#analysing-a-big-tab).
+That's the table from Opus 5.5's answer. It took five small calls over all 50,009 rows: a look at the tab, this breakdown, two drill-downs, and a check that the lines add up to the report's total — they do, to the cent. The five results came to about 2,300 tokens and the whole exchange to about 15,000, thinking included, on top of the system prompt and the server's own tool descriptions and instructions, which take about 6,500. Two reruns took 17,000 and 25,000, and the difference is nearly all thinking. Loading the tab itself would take close to six million. The sheet is public, so the same question works for you. [How it works](#analysing-a-big-tab).
 
 - **Everything is local.** A process on your machine, started by Claude Desktop over stdio.
 - **Nothing is sent anywhere else.** Your laptop talks to Google and back. No SaaS in the middle, no third party holding a token for your Drive.
@@ -207,9 +207,9 @@ BW-GD-0210-SET	5885.79	123
 
 Only the four columns the query names leave Google, not all 24, and 174 tokens reach the model. Reading the tab instead would be ten full pages of nearly 600,000 tokens each.
 
-It counts the way a person would: empty cells are skipped, so a totals line with a blank order id isn't an order, and numbers are read as the sheet shows them — `$1,240.50`, `12%`, `(340)`. There's no `having`, no second level of grouping and no `or` on purpose: anything past a group-by with a filter is "get the groups and finish the arithmetic in context", and that boundary keeps the schema small enough for a model to fill in correctly.
+It counts the way a person would: empty cells are skipped, so a totals line with a blank order id isn't an order, and numbers are read as the sheet shows them — `$1,240.50`, `-$87`, `(340)`, `1.234,56 €`, and `12%` as 12. A column that mixes `12%` with a bare `0.12`, the same number to Sheets, gets a `mixed scale:` line instead of a quietly wrong total. There's no `having`, no second level of grouping and no `or` on purpose: anything past a group-by with a filter is "get the groups and finish the arithmetic in context", and that boundary keeps the schema small enough for a model to fill in correctly.
 
-When you do need the rows, `gsheets_read_sheet` returns them a page at a time, `GSHEETS_MAX_READ_ROWS` (5,000 by default) per call, and says which `offset` to continue from. On a wide tab, `columns: ["G", "H", "O"]` reads only those columns, so a row of the 24-column fixture costs a dozen tokens instead of about ninety. The page cap protects the model's context, which is why `gsheets_aggregate` reads every row regardless: none of them reach the model.
+When you do need the rows, `gsheets_read_sheet` returns them a page at a time, `GSHEETS_MAX_READ_ROWS` (5,000 by default) per call, and says which `offset` to continue from. On a wide tab, `columns: ["G", "H", "O"]` reads only those columns, so a row of the 24-column fixture costs about 18 tokens instead of about 115. The page cap protects the model's context, which is why `gsheets_aggregate` reads every row regardless: none of them reach the model.
 
 ### Colouring cells
 

@@ -907,6 +907,12 @@ def _render_aggregate(payload: dict) -> dict | str:
     head = [scanned, groups]
     for label, count in payload.get("skipped", {}).items():
         head.append(f"skipped: {count} cells in {label} were not numbers")
+    for label, mix in payload.get("mixed_scale", {}).items():
+        where = ""
+        if payload["groups"] > 1:
+            where = f", in {mix['groups']} of {payload['groups']} groups"
+        head.append(f"mixed scale: {label} read {mix['percent']} percentages at face value "
+                    f"(12% as 12) and {mix['plain']} plain numbers (0.12 as 0.12){where}")
     return "\n".join(head) + "\n\n" + rows_to_tsv(payload["values"])
 
 

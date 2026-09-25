@@ -535,6 +535,33 @@ def test_aggregate_says_when_it_skipped_cells_that_were_not_numbers(values):
     assert result.endswith("avg(amount)\n8.5")
 
 
+def test_aggregate_says_when_a_column_mixes_percentages_with_plain_numbers(values):
+    _settlement(values)
+    values.batchGet.return_value.execute.return_value = {"valueRanges": [
+        {"values": [["amount", "12%", "0.12", "30%", "0.3"]]},
+    ]}
+    result = tools.gsheets_aggregate({
+        "spreadsheet_id": "SSID", "sheet_name": "Data",
+        "metrics": [{"column": "amount", "fn": "sum"}],
+    })
+    assert ("mixed scale: sum(amount) read 2 percentages at face value (12% as 12) "
+            "and 2 plain numbers (0.12 as 0.12)\n") in result
+
+
+def test_aggregate_says_which_share_of_the_groups_mixes_scales(values):
+    _settlement(values)
+    values.batchGet.return_value.execute.return_value = {"valueRanges": [
+        {"values": [["sku", "A-1", "A-1", "B-2"]]},
+        {"values": [["amount", "12%", "0.12", "7.00"]]},
+    ]}
+    result = tools.gsheets_aggregate({
+        "spreadsheet_id": "SSID", "sheet_name": "Data",
+        "group_by": ["sku"], "metrics": [{"column": "amount", "fn": "sum"}],
+    })
+    assert ("mixed scale: sum(amount) read 1 percentages at face value (12% as 12) "
+            "and 1 plain numbers (0.12 as 0.12), in 1 of 2 groups\n") in result
+
+
 def test_aggregate_resolves_names_case_insensitively_and_letters_by_position(values, env):
     env(gsheets_output_format="json")
     _settlement(values)

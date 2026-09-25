@@ -254,36 +254,96 @@ _DATE = re.compile(
 )
 
 #: Thousands-grouped digits, either convention, with either decimal mark after
-#: them. Matched as a whole so a lone comma
-#: keeps its other meaning: '1,5' is a decimal to half the world, and only groups
-#: of exactly three digits are unambiguous enough to throw away.
-_GROUPED = re.compile(r"[-+]?\d{1,3}(?:[,\u00a0 ]\d{3})+(?P<fraction>[.,]\d+)?")
+#: them. Matched as a whole so a lone comma keeps its other meaning: '1,5' is a
+#: decimal to half the world, and only groups of exactly three digits are
+#: unambiguous enough to throw away. The separator is the same all the way through
+#: ('1.234.567', '1 234 567'), so '1,234.56' and '1.234,56' both read and
+#: '1,234 567' does not. A narrow no-break space is what Sheets puts between groups
+#: in the fr locale, an apostrophe in de-CH — typed, or the typographic one. And a
+#: number never starts with a group of zero: '0,125' is a decimal, not 125.
+_GROUPED = re.compile(
+    r"[1-9]\d{0,2}(?P<sep>[,.  '’ ])\d{3}(?:(?P=sep)\d{3})*(?P<fraction>[.,]\d+)?"
+)
 
-_SEPARATORS = re.compile(r"[,\u00a0 ]")
-_CURRENCY = "$€£¥₽₴₸"
+_SEPARATORS = re.compile(r"[,.  '’ ]")
+
+#: What most cells in a numeric column already are; skips the peeling below.
+_PLAIN = re.compile(r"-?\d+(?:\.\d+)?")
+
+#: Sheets writes a hyphen-minus; the others arrive with pasted or imported text.
+_MINUS = str.maketrans(dict.fromkeys("−–—﹣－", "-"))
+_SYMBOLS = "$€£¥₽₴₸₹₩₪₫₺₦₱฿₡₲₵₭₮₼₾¢"
+_CODES = ("USD|EUR|GBP|CHF|JPY|CNY|CAD|AUD|NZD|BRL|MXN|PLN|CZK|HUF|SEK|NOK|DKK"
+          "|RUB|UAH|KZT|BYN|INR|TRY|ILS|ZAR")
+#: Currency before the number: '$', 'US$', 'R$', 'CA$', or a code and a space.
+_CURRENCY_BEFORE = re.compile(rf"(?:[A-Z]{{1,3}})?[{_SYMBOLS}]\s*|(?:{_CODES})\s+")
+#: Currency after it: '87 €', '87€', '87 USD', '87 zł', '87,00 kr.'.
+_CURRENCY_AFTER = re.compile(
+    rf"(?:\s*[{_SYMBOLS}]|\s+(?:{_CODES})|\s*(?:zł|kr\.?|Kč|Ft|lei))$"
+)
+
+
+def _strip_presentation(text: str) -> tuple[str, bool]:
+    """Peel sign, accounting brackets, currency and percent off a cell, in any order.
+
+    Sheets shows a negative dollar as '-$87', other locales as '$-87' or
+    '-87,00 €', accounting formats as '($87.00)' — currency and percent can sit
+    inside or outside the sign, so the wrappers come off one at a time until only
+    the digits and their marks are left. The sign is a minus or brackets, never
+    both: in '(-87)' the minus stays on, and :func:`parse_number` refuses it as a
+    second sign. Returns what is left and whether the value was negative.
+    """
+    s = text.strip().translate(_MINUS)
+    negative = signed = percent = False
+    while s:
+        if not signed and s[0] in "+-":
+            negative, signed = s[0] == "-", True
+            s = s[1:].lstrip()
+        elif not signed and s[0] == "(" and s[-1] == ")":
+            negative = signed = True
+            s = s[1:-1].strip()
+        elif not percent and s[-1] == "%":
+            percent = True
+            s = s[:-1].rstrip()
+        elif match := _CURRENCY_BEFORE.match(s):
+            s = s[match.end():]
+        elif match := _CURRENCY_AFTER.search(s):
+            s = s[: match.start()]
+        else:
+            break
+    return s, negative
 
 
 def parse_number(text: str) -> float | None:
     """The number behind a *formatted* cell, or None when it does not read as one.
 
     The values API is called without ``valueRenderOption``, so every cell arrives
-    as the string the sheet displays — ``'$1,240.50'``, ``'12%'`` and ``'(340)'``
-    included. Undoing that presentation is the only way to tell a numeric column
-    from a text one, and the only way to add such a column up. A percent comes
-    back as its face value: ``'12%'`` is 12, not 0.12.
+    as the string the sheet displays — ``'$1,240.50'``, ``'-$87'``, ``'12%'``,
+    ``'(340)'`` and ``'1.234,56 €'`` included. Undoing that presentation is the
+    only way to tell a numeric column from a text one, and the only way to add such
+    a column up. A percent comes back as its face value: ``'12%'`` is 12, not 0.12.
     """
-    cleaned = text.strip().lstrip(_CURRENCY).rstrip("%").strip()
-    if cleaned.startswith("(") and cleaned.endswith(")"):
-        cleaned = "-" + cleaned[1:-1]  # accounting negatives
+    if _PLAIN.fullmatch(text):
+        return float(text)
+    cleaned, negative = _strip_presentation(text)
     grouped = _GROUPED.fullmatch(cleaned)
+    fraction = grouped.group("fraction") if grouped else None
+    if grouped and fraction and fraction[0] == grouped.group("sep"):
+        grouped = None  # '1,234,5': the separator can't also be the decimal mark
+    if grouped and grouped.group("sep") == "." and not fraction and cleaned.count(".") == 1:
+        grouped = None  # '1.234' is a decimal to the en locale; '1.234.567' is not
     if grouped:
         # Only the grouping goes. The decimal mark after the last group is whichever
         # one this locale renders, so '1 240,50' must not collapse to 124050.
-        fraction = grouped.group("fraction") or ""
+        fraction = fraction or ""
         whole = cleaned[: len(cleaned) - len(fraction)]
         cleaned = _SEPARATORS.sub("", whole) + fraction.replace(",", ".")
     elif cleaned.count(",") == 1 and "." not in cleaned:
         cleaned = cleaned.replace(",", ".")  # decimal comma
+    if not cleaned or cleaned[0] in "+-":
+        return None  # a second sign, as in '--5', '-$-5' or '(-87)', is not a number
+    if negative:
+        cleaned = "-" + cleaned
     if not any(char.isdigit() for char in cleaned):
         # float() also accepts 'nan' and 'inf', which in a spreadsheet are words.
         return None

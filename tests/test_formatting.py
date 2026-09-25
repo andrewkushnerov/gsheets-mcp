@@ -1,4 +1,7 @@
 """Colour parsing, A1 ranges and TSV rendering. No mocks — it is all pure functions."""
+import csv
+import pathlib
+
 import pytest
 
 from gsheets_mcp.formatting import (
@@ -11,10 +14,13 @@ from gsheets_mcp.formatting import (
     escape_cell,
     guess_type,
     parse_color,
+    parse_number,
     profile_columns,
     rows_to_tsv,
     window_a1,
 )
+
+FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 
 
 def test_hex_colour():
@@ -245,3 +251,86 @@ def test_profile_columns_drops_the_blanks_and_keeps_the_named():
 def test_profile_columns_of_nothing():
     assert profile_columns([]) == ([], [])
     assert profile_columns([["", ""]]) == ([], ["A", "B"])
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("-$87", -87),                   # how Sheets shows a negative dollar in en_US
+        ("-$1,234.56", -1234.56),
+        ("$-87", -87),
+        ("($87.00)", -87),               # accounting format wraps the symbol too
+        ("$(87.00)", -87),
+        ("−$87", -87),              # minus sign
+        ("–$87", -87),              # en dash, as pasted from a report
+        ("+$5", 5),
+        ("US$87", 87),
+        ("USD 87", 87),
+        ("87 €", 87),               # currency after the number
+        ("-87,50 €", -87.5),
+        ("€1.234,56", 1234.56),     # dot grouping, comma decimal
+        ("-1.234,56 €", -1234.56),
+        ("1 234,56", 1234.56),      # narrow no-break space (fr)
+        ("1'234.56", 1234.56),           # de-CH
+        ("1.234.567", 1234567),
+        ("1.234", 1.234),                # one dot, no comma: still a decimal point
+        ("R$ 87,00", 87),
+        ("87 zł", 87),
+        ("(12%)", -12),
+        ("−12%", -12),
+        ("–35.4%", -35.4),
+        ("SKU123", None),                # a code, not a number
+        ("Total $5", None),
+        ("--5", None),
+        ("-$-5", None),
+        ("1,234,5", None),
+        ("$", None),
+        ("-", None),
+    ],
+)
+def test_parse_number_reads_currency_and_sign_in_any_order(value, expected):
+    assert parse_number(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("(-87)", None),                 # a minus or brackets, not both
+        ("-(87)", None),
+        ("$(-87)", None),
+        ("0,125", 0.125),                # no number starts with a group of zero
+        ("0,125 %", 0.125),
+        ("1’234.56", 1234.56),      # de-CH, typographic apostrophe
+        ("1.234,56 kr.", 1234.56),       # da: the krone keeps its full stop
+        ("1,234 567", None),             # two separators, so neither is grouping
+        ("12,345,67", None),
+    ],
+)
+def test_parse_number_edges(value, expected):
+    assert parse_number(value) == expected
+
+
+def _test_spreadsheet():
+    with open(FIXTURES / "parse_number_cases.csv", newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+@pytest.mark.parametrize(
+    "case", _test_spreadsheet(), ids=lambda case: f"{case['tab']}:{case['case']}"
+)
+def test_parse_number_reads_the_test_spreadsheet(case):
+    """Every cell of a spreadsheet made to break parse_number, as the values API returns it.
+
+    The fixture keeps its three tabs: ``raw_text`` holds text typed to look like
+    money, ``typed`` real numbers under currency and percent formats (``stored`` is
+    the number beneath, blank where the cell is text), and ``mixed_pct`` one column
+    where 12% and a bare 0.12 are the same number. ``expected`` is what a reader
+    takes each cell to mean.
+    """
+    expected = float(case["expected"])
+    if case["kind"] == "pct" and "%" not in case["value"]:
+        # 0.12 is 12% to Sheets exactly as much as a cell showing '12%' is; only the
+        # number format says so, and the values API does not send formats. A bare
+        # fraction reads as itself, and gsheets_aggregate flags a column that has both.
+        expected /= 100
+    assert parse_number(case["value"]) == expected

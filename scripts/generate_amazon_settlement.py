@@ -38,7 +38,7 @@ DEFAULT_START = "2026-08-02"
 
 #: What a bare run writes. 5k is a whisker over the default GSHEETS_MAX_READ_ROWS
 #: page, so reading the whole tab has to page exactly once — the boundary worth
-#: testing — and still costs about half a million tokens if something reads it raw.
+#: testing — and still costs nearly 600,000 tokens if something reads it raw.
 #: 50k is ten pages: the stress case. Different seeds and weeks, so they are two
 #: settlements rather than one and a prefix of it.
 FIXTURES = [
@@ -527,20 +527,29 @@ def generate(rows: int, seed: int = DEFAULT_SEED, start: str = DEFAULT_START):
     return Settlement(seed, start).build(rows)
 
 
+#: How far the rules in :func:`estimate_tokens` fall short of Claude on this text.
+#: Measured on Opus 5.5: a 1,000-row page of the 50k fixture, as the server returns
+#: it from the demo sheet, is 115,827 tokens where the rules count 96,030. The digit
+#: rule holds (a nine-digit number is three tokens), so the shortfall is spread over
+#: the rest, and one factor is as precise as the rules themselves.
+CALIBRATION = 1.2
+
+
 def estimate_tokens(table) -> int:
-    """Roughly what a model pays to read the table as the server renders it (TSV).
+    """Roughly what Claude pays to read the table as the server renders it (TSV).
 
     A BPE tokenizer takes up to three digits per token, a common word in one, a
     camel-case compound in one per part, and every dash, dot, colon and tab on its
-    own — which on this text comes to about two characters a token, not the four
-    that prose gets. Good enough to size the fixture by; not a figure to quote.
+    own — which on this text comes to under two characters a token, not the four
+    that prose gets. Scaled by :data:`CALIBRATION`, it lands within a percent or
+    two of the measured count; a new tokenizer would move it again.
     """
     text = "\n".join("\t".join(row) for row in table)
     digits = sum(-(-len(run) // 3) for run in re.findall(r"\d+", text))
     words = sum(1 + (len(word) > 10) for word in re.findall(r"[A-Z]?[a-z]+", text))
     acronyms = sum(-(-len(run) // 3) for run in re.findall(r"[A-Z]{2,}(?![a-z])", text))
     marks = len(re.findall(r"[^\w\s]|[\t\n]", text))
-    return digits + words + acronyms + marks
+    return round((digits + words + acronyms + marks) * CALIBRATION)
 
 
 def write(rows: int, seed: int, start: str, path: str) -> None:

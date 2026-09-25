@@ -85,6 +85,10 @@ class _Stat:
     numeric while every cell read as a number and
     textual from the first that did not — the text extremes are tracked alongside
     so that fallback costs no second pass.
+
+    Percentages and plain numbers are counted apart. A percent reads at face value,
+    so where a group holds both, ``12%`` counts as 12 next to a ``0.12`` that the
+    sheet stores as the same number — the caller has to say so, since no cell can.
     """
 
     def __init__(self, fn: str):
@@ -93,6 +97,7 @@ class _Stat:
         self.total = 0.0
         self.lost = 0.0  # the low-order bits each addition dropped, to add back at the end
         self.skipped = 0
+        self.percents = self.plain = 0
         self.distinct: set[str] | None = set() if fn == "count_distinct" else None
         self.low = self.high = None
         self.text_low = self.text_high = None
@@ -113,6 +118,11 @@ class _Stat:
             self.distinct.add(text)
             return
         number = parse_number(text)
+        if number is not None:
+            if "%" in text:
+                self.percents += 1
+            else:
+                self.plain += 1
         if fn in ("sum", "avg"):
             if number is None:
                 self.skipped += 1
@@ -220,4 +230,17 @@ def aggregate(rows, keys: list[Key], metrics: list[Metric], where: list[Conditio
     }
     if skipped:
         result["skipped"] = skipped
+    mixed = {}
+    for i, metric in enumerate(metrics):
+        # Only within a group: a percent in one and a plain number in another are two
+        # measures side by side, the way a long-format table of metrics keeps them.
+        clashes = [stats[i] for stats in groups.values() if stats[i].percents and stats[i].plain]
+        if clashes:
+            mixed[metric.label] = {
+                "groups": len(clashes),
+                "percent": sum(stat.percents for stat in clashes),
+                "plain": sum(stat.plain for stat in clashes),
+            }
+    if mixed:
+        result["mixed_scale"] = mixed
     return result

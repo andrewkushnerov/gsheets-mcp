@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.4 — 2026-09-25
+
+Negative money reads as money, and the README measures the tokens it quotes.
+
+### Fixed
+
+- A negative amount in a currency format is a number again. Sheets writes the
+  minus outside the symbol — `-$87`, `-€87` — and `parse_number` took a leading
+  symbol off but not a sign in front of it, so those cells counted as text:
+  `gsheets_aggregate` skipped every negative in a dollar column and a total came
+  back with the refunds missing. Sign, accounting brackets, currency and percent
+  now come off in any order, which also reads `($87.00)`, `US$87`, `USD 87`,
+  `87 €`, `R$ 87,00`, `87 zł`, a minus sign or en dash pasted in for the hyphen,
+  and dot-grouped thousands, `1.234.567` and `€1.234,56`; `1.234` alone is still
+  one point two three four. Checked against a spreadsheet of 49 formatted cells,
+  kept as `tests/fixtures/parse_number_cases.csv`: 20 read right before, 48 now, and
+  the 49th is the percent below.
+- `0,125` is 0.125, not 125: no group of thousands starts with a zero. A separator
+  that would have to do two jobs, as in `12,345,67` or `1,234 567`, no longer makes
+  a number, and neither does a minus inside brackets, `(-87)`.
+
+### Added
+
+- A `mixed scale:` line from `gsheets_aggregate` when one group feeds a metric both
+  percentages and plain numbers. A percent reads at face value, `12%` as 12, while
+  the sheet stores it as 0.12, so a cell showing that same value without the format,
+  `0.12`, lands in the sum a hundred times smaller. No single cell can tell; the
+  group can. Percentages in one group and dollars in another, the way a long-format
+  table of metrics keeps them, are not a mix.
+
+### Changed
+
+- The README's settlement example is Opus 5.5's answer, and its token figures are
+  measured: about 2,300 tokens of tool results and 15,000 for the whole exchange,
+  thinking included, where it said 42,000; two reruns took 17,000 and 25,000. That
+  is Claude Code on Opus 5.5 with only this server connected, read as the context
+  after the answer minus the same session answering "OK". A row of the fixture is
+  about 115 tokens and three of its columns about 18, where the README said ninety
+  and a dozen. The 174-token aggregate, the 600,000-token page and the six-million
+  tab were already right.
+- `generate_amazon_settlement.py` scales its token estimate by the same measurement,
+  so it prints ~5.75M for the 50k fixture instead of 4.79M and agrees with the
+  README.
+
 ## 0.4.3 — 2026-09-23
 
 A second example in the README, on a 50k-row report anyone can try, and a setup that

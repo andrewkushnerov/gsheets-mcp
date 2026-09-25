@@ -122,3 +122,36 @@ def test_render_number_drops_float_noise():
     assert render_number(-0.0) == "0"
     assert render_number(None) == ""
     assert render_number("text") == "text"
+
+
+def test_negative_currency_is_summed_not_skipped():
+    """'-$87' is what Sheets displays for -87 in a $ column; skipping it flips the sign
+    of a total."""
+    rows = [["$1,234.56"], ["-$87"], ["-$1,234.56"], ["($87.00)"], ["$87"]]
+    result = aggregate(rows, [], [Metric("sum", 0, "sum"), Metric("min", 0, "min")], [], 1)
+    assert result["values"][1] == ["-87", "-1234.56"]
+    assert "skipped" not in result
+
+
+def test_a_column_mixing_percentages_with_plain_numbers_says_so():
+    """The mixed_pct tab of the test spreadsheet: Sheets stores 0.12 under both '12%'
+    and '0.12', and at face value the two are a hundred times apart."""
+    rows = [["12%"], ["0.12"], ["30%"], ["0.3"]]
+    result = aggregate(rows, [], [Metric("sum", 0, "sum(margin)")], [], 1)
+    assert result["values"][1] == ["42.42"]
+    assert result["mixed_scale"] == {"sum(margin)": {"groups": 1, "percent": 2, "plain": 2}}
+    # One scale throughout is nothing to report, whichever scale it is.
+    for column in (["12%", "30%"], ["0.12", "0.3"]):
+        rows = [[cell] for cell in column]
+        assert "mixed_scale" not in aggregate(rows, [], [Metric("avg", 0, "avg")], [], 1)
+
+
+def test_scales_only_clash_within_a_group():
+    """A long-format table keeps a margin and a revenue in one column; grouped by the
+    metric's name, each group has one scale, and only a group with two is reported."""
+    rows = [["margin", "12%"], ["margin", "30%"], ["revenue", "$87"], ["revenue", "-$87"]]
+    by_name = aggregate(rows, [Key(0, "metric")], [Metric("sum", 1, "sum(value)")], [], 10)
+    assert "mixed_scale" not in by_name
+    rows.append(["margin", "0.12"])
+    by_name = aggregate(rows, [Key(0, "metric")], [Metric("sum", 1, "sum(value)")], [], 10)
+    assert by_name["mixed_scale"] == {"sum(value)": {"groups": 1, "percent": 2, "plain": 1}}
