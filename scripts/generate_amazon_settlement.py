@@ -572,8 +572,8 @@ def write(rows: int, seed: int, start: str, path: str) -> None:
     print(f"  {counts['amazon'] + counts['external']} orders ({counts['external']} of them "
           f"Non-Amazon), {counts['refund']} refunds; settlement total "
           f"{table[1][_INDEX['total_amount']]} USD")
-    print(f"  ~{estimate_tokens(table) / 1e6:.2f}M tokens to read in full as TSV, "
-          "about twice that as JSON (rough estimate)")
+    print(f"  ~{estimate_tokens(table) / 1e6:.2f}M tokens to read in full as TSV "
+          "(rough estimate)")
 
 
 def write_fixtures(directory: str) -> None:

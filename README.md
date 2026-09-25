@@ -205,7 +205,7 @@ BW-KT-0118-SET	6746.32	153
 BW-GD-0210-SET	5885.79	123
 ```
 
-Only the four columns the query names leave Google, not all 24, and 174 tokens reach the model. Reading the tab instead would be ten full pages of nearly 600,000 tokens each.
+Only the four columns the query names leave Google, not all 24, and 177 tokens reach the model. Reading the tab instead would be ten full pages of nearly 600,000 tokens each.
 
 It counts the way a person would: empty cells are skipped, so a totals line with a blank order id isn't an order, and numbers are read as the sheet shows them — `$1,240.50`, `-$87`, `(340)`, `1.234,56 €`, and `12%` as 12. A column that mixes `12%` with a bare `0.12`, the same number to Sheets, gets a `mixed scale:` line instead of a quietly wrong total. There's no `having`, no second level of grouping and no `or` on purpose: anything past a group-by with a filter is "get the groups and finish the arithmetic in context", and that boundary keeps the schema small enough for a model to fill in correctly.
 
@@ -267,7 +267,7 @@ All settings are environment variables, and every one has a working default, see
 | `GSHEETS_READ_ONLY` | `false` | `true` and the write tools aren't registered at all. |
 | `GSHEETS_ALLOWED_SPREADSHEETS` | — | Comma-separated ids. Empty means anything the Google identity can open. |
 | `GSHEETS_MAX_READ_ROWS` | `5000` | Page size for reads, and the ceiling on `limit`. `0` is unlimited and disables paging. |
-| `GSHEETS_OUTPUT_FORMAT` | `tsv` | Sheet contents and the tab list as tab-separated text, or `json` for structured output. TSV costs roughly half the tokens. |
+| `GSHEETS_OUTPUT_FORMAT` | `tsv` | Sheet contents and the tab list as tab-separated text, or `json` for structured output. JSON costs more tokens: on the 50k fixture, 8% more per row and 61% more for the tab profile. |
 | `GSHEETS_ENABLE_DRIVE_SEARCH` | `false` | `true` registers `gsheets_find_spreadsheets` and asks for the Drive scope. |
 | `LOG_LEVEL` | `INFO` | Standard Python levels. |
 
@@ -379,6 +379,14 @@ python scripts/generate_amazon_settlement.py    # → tests/fixtures/amazon_sett
 ```
 
 They have the shape of Amazon's settlement report — 24 columns, a line per money movement, several per order — over a made-up catalogue and made-up ids, tab-separated like the real download. The 5k one is a whisker over the default `GSHEETS_MAX_READ_ROWS` page, so a whole-tab read has to page exactly once, and it still costs nearly 600,000 tokens read raw; the 50k one is ten pages and close to six million. Import one into a spreadsheet (File → Import) and point the server at it. `--rows N --out file` writes one of any size (`.csv` gets commas), `--seed` reshuffles it.
+
+What reading the 50k one costs a model, in Claude tokens, for the working tree or any release:
+
+```bash
+python bench/tokens.py                  # --ref v0.2.0 for a release; --counter chars needs no key
+```
+
+Every read tool runs against the fixture offline, through an in-memory Sheets API, so each figure is the exact text a client would get. [bench/README.md](bench/README.md) says how it counts, and has the numbers from 0.1.0 on.
 
 Poke at a running server by hand:
 

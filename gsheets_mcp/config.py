@@ -37,10 +37,11 @@ class Settings(BaseSettings):
     # to JSON-decode a list-typed field coming from the environment.
     gsheets_allowed_spreadsheets: str = ""
     gsheets_max_read_rows: int = 5000
-    # Wire format for the tools that return a grid of cells. The same 1000x8 table
-    # costs ~37k tokens as indented JSON and ~16k as TSV, and the API hands us
-    # every cell as a string anyway, so TSV loses nothing. Set "json" if something
-    # downstream parses the tool output instead of reading it.
+    # Wire format for the tools that return a grid of cells. TSV is the cheaper read:
+    # JSON costs 8% more tokens a row on the 50k fixture and 61% more for its tab
+    # profile, and the API hands us every cell as a string anyway, so TSV loses
+    # nothing. Set "json" if something downstream parses the tool output instead of
+    # reading it.
     gsheets_output_format: Literal["tsv", "json"] = "tsv"
     # Off by default: searching Drive is the one capability that lets the model
     # discover documents you never handed it. Turning it on also needs a wider

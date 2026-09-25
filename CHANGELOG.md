@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.5 — 2026-09-25
+
+A token bench added
+
+### Added
+
+- `bench/tokens.py`: what reading the 50k fixture costs a model, in Claude tokens, for
+  the working tree or any release (`--ref v0.1.0`). It runs offline, against an
+  in-memory Sheets API checked against the real one, and counts with
+  `messages.count_tokens`, or through the Claude Code CLI when there is no API key.
+
+
 ## 0.4.4 — 2026-09-25
 
 Negative money reads as money, and the README measures the tokens it quotes.

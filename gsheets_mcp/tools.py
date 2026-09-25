@@ -588,10 +588,10 @@ def _render_grid(payload: dict) -> dict | str:
     """A grid response in whichever wire format ``GSHEETS_OUTPUT_FORMAT`` asks for.
 
     JSON keeps the structure; TSV says the same things as a two-line header plus a
-    tab-separated table, and costs the model roughly half the tokens for a table of
-    any size — indented JSON spends three lines and ~40 bytes on a cell that TSV
-    writes with one tab. Nothing is lost in the trade: the values API is called
-    without ``valueRenderOption``, so every cell already arrives as a string.
+    tab-separated table, with one tab where JSON spends two quotes and a comma on
+    every cell: 8% fewer tokens a row on the 50k settlement fixture (bench/tokens.py).
+    Nothing is lost in the trade: the values API is called without
+    ``valueRenderOption``, so every cell already arrives as a string.
 
     Both formats are rendered from the same dict, so they cannot drift on the facts.
     """

@@ -12,6 +12,9 @@ secrets/
 # Personal notes / drafts (article outlines etc.)
 notes/
 
+# Token bench: counts and unpacked releases, rebuilt on demand
+bench/.cache/
+
 # Python
 __pycache__/
 *.py[cod]
